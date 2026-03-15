@@ -29,6 +29,19 @@ from romav2.types import Setting, ImageLike
 logger = logging.getLogger(__name__)
 
 
+def _compile_supported_for_device(dev: torch.device) -> tuple[bool, str | None]:
+    if not hasattr(nn.Module, "compile"):
+        return False, "torch.compile is unavailable in this PyTorch build"
+    if dev.type == "cuda":
+        try:
+            import triton  # noqa: F401
+        except Exception as exc:  # pragma: no cover - env dependent
+            return False, f"CUDA compilation requires a working 'triton' package ({exc})"
+    if dev.type == "mps":
+        return False, "torch.compile is disabled on MPS for stability"
+    return True, None
+
+
 def _interpolate_warp_and_confidence(
     *,
     warp: torch.Tensor,
@@ -111,8 +124,15 @@ class RoMaV2(nn.Module):
         self.name = cfg.name
         self.load_state_dict(weights)
         if cfg.compile:
-            logger.info(f"Compiling {self.name}...")
-            self.compile()
+            can_compile, reason = _compile_supported_for_device(device)
+            if can_compile:
+                logger.info(f"Compiling {self.name}...")
+                self.compile()
+            else:
+                logger.warning(
+                    f"Skipping torch.compile for {self.name}: {reason}. "
+                    "Continuing in eager mode."
+                )
         logger.info(f"{self.name} initialized.")
 
     def apply_setting(self, setting: Setting):
