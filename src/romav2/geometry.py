@@ -6,6 +6,13 @@ from einops import einsum
 from romav2.types import ConfidenceMode
 import numpy as np
 
+_NORMALIZED_GRID_CACHE: dict[tuple[str, int | None, int, int], torch.Tensor] = {}
+_PIXEL_GRID_CACHE: dict[tuple[str, int | None, int, int], torch.Tensor] = {}
+
+
+def _grid_cache_key(dev: torch.device, H: int, W: int) -> tuple[str, int | None, int, int]:
+    return (dev.type, dev.index, H, W)
+
 
 def to_homogeneous(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((x, torch.ones_like(x[..., :1])), dim=-1)
@@ -21,15 +28,16 @@ def get_normalized_grid(
     W: int,
     overload_device: torch.device | None = None,
 ) -> torch.Tensor:
-    x1_n = torch.meshgrid(
-        *[
-            torch.linspace(-1 + 1 / n, 1 - 1 / n, n, device=overload_device or device)
-            for n in (B, H, W)
-        ],
-        indexing="ij",
-    )
-    x1_n = torch.stack((x1_n[2], x1_n[1]), dim=-1).reshape(B, H, W, 2)
-    return x1_n
+    dev = overload_device or device
+    key = _grid_cache_key(dev, H, W)
+    base_grid = _NORMALIZED_GRID_CACHE.get(key)
+    if base_grid is None:
+        y = torch.linspace(-1 + 1 / H, 1 - 1 / H, H, device=dev)
+        x = torch.linspace(-1 + 1 / W, 1 - 1 / W, W, device=dev)
+        yx = torch.meshgrid(y, x, indexing="ij")
+        base_grid = torch.stack((yx[1], yx[0]), dim=-1).unsqueeze(0)
+        _NORMALIZED_GRID_CACHE[key] = base_grid
+    return base_grid.expand(B, -1, -1, -1)
 
 
 def get_pixel_grid(
@@ -39,12 +47,16 @@ def get_pixel_grid(
     W: int,
     overload_device: torch.device | None = None,
 ) -> torch.Tensor:
-    x1_n = torch.meshgrid(
-        *[torch.arange(n, device=overload_device or device) + 0.5 for n in (B, H, W)],
-        indexing="ij",
-    )
-    x1_n = torch.stack((x1_n[2], x1_n[1]), dim=-1).reshape(B, H, W, 2)
-    return x1_n
+    dev = overload_device or device
+    key = _grid_cache_key(dev, H, W)
+    base_grid = _PIXEL_GRID_CACHE.get(key)
+    if base_grid is None:
+        y = torch.arange(H, device=dev, dtype=torch.float32) + 0.5
+        x = torch.arange(W, device=dev, dtype=torch.float32) + 0.5
+        yx = torch.meshgrid(y, x, indexing="ij")
+        base_grid = torch.stack((yx[1], yx[0]), dim=-1).unsqueeze(0)
+        _PIXEL_GRID_CACHE[key] = base_grid
+    return base_grid.expand(B, -1, -1, -1)
 
 
 def to_normalized(x: torch.Tensor, *, H: int, W: int) -> torch.Tensor:
