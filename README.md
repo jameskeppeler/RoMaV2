@@ -68,6 +68,37 @@ or
 uv sync
 ```
 
+## GUI Workflows
+Use the unified launcher:
+```bash
+uv run python run_romav2_gui.py
+```
+Behavior:
+- Prefers Qt GUI (includes in-app browser + Step 0) when PySide6 is installed.
+- Falls back automatically to legacy Tkinter GUI if Qt dependencies are missing.
+
+Install Qt GUI dependencies:
+```bash
+uv sync --extra gui
+```
+
+Optional backend overrides:
+```bash
+uv run python run_romav2_gui.py --qt
+uv run python run_romav2_gui.py --tk
+```
+
+Qt GUI workflow:
+1. Load your B&W image in **Step 1**, then click **Build Prompt from B&W** in **Step 0**.
+2. Sign in to ChatGPT inside the embedded browser (session is persisted locally).
+3. Upload your B&W image, paste/copy the generated prompt, and generate the colorized + expanded image.
+4. Download the result, then click **Import Latest Download**.
+5. In **Step 3**, click **Colorize** to run `run_romav2_pair.py`.
+
+Notes:
+- This is a manual-in-the-loop browser flow (no API keys, no UI click automation).
+- Browser profile data is saved under `.qt_browser_profile/`.
+
 ## Benchmarks
 If you do not already have MegaDepth and ScanNet, you can the following to download them:
 ```bash

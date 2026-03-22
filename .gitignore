@@ -5,3 +5,4 @@ __pycache__/
 wandb/
 uv.lock
 outputs/
+.qt_browser_profile/
