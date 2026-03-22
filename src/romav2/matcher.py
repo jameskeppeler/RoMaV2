@@ -136,7 +136,9 @@ class Matcher(nn.Module):
         ).reshape(B, H_B, W_B, -1)
         pos_emb_grid = torch.cat((x_emb.sin(), x_emb.cos()), dim=-1)
 
-        with torch.autocast(device.type, torch.bfloat16, enabled=self.cfg.enable_amp):
+        amp_device_type = f_A.device.type
+        amp_enabled = bool(self.cfg.enable_amp and amp_device_type == "cuda")
+        with torch.autocast(amp_device_type, torch.bfloat16, enabled=amp_enabled):
             assert self.mv_vit is not None
             f_mv_AB = self.mv_vit(torch.stack((f_A, f_B), dim=1))[
                 "x_norm_patchtokens"

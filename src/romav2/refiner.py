@@ -55,8 +55,10 @@ class Block(nn.Module):
         self.enable_amp = enable_amp
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        amp_device_type = x.device.type
+        amp_enabled = bool(self.enable_amp and amp_device_type == "cuda")
         with torch.autocast(
-            device_type=device.type, enabled=self.enable_amp, dtype=torch.bfloat16
+            device_type=amp_device_type, enabled=amp_enabled, dtype=torch.bfloat16
         ):
             x = self.conv_depthwise(x)
             x = self.norm(x)

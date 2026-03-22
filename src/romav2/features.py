@@ -21,8 +21,10 @@ def wrap_with_normalize(
     normalize_feats: bool,
 ):
     def wrapped_forward(self, img: torch.Tensor) -> list[torch.Tensor]:
+        amp_device_type = img.device.type
+        amp_enabled = bool(enable_amp and amp_device_type == "cuda")
         with (
-            torch.autocast(device.type, torch.bfloat16, enabled=enable_amp),
+            torch.autocast(amp_device_type, torch.bfloat16, enabled=amp_enabled),
             torch.set_grad_enabled(not frozen),
         ):
             if self.training and frozen:
@@ -56,7 +58,9 @@ def wrap_model(
     normalize_feats: bool,
     func: Any,
 ):
-    if enable_amp and frozen:  # if training we want params in fp32
+    # Keep weights in fp32 on non-CUDA backends to avoid dtype mismatch and
+    # slow CPU bf16 paths. CUDA autocast still benefits from bf16 storage.
+    if enable_amp and frozen and device.type == "cuda":  # if training we want params in fp32
         model = model.to(torch.bfloat16)
     if frozen:
         for param in model.parameters():
@@ -137,7 +141,9 @@ class Descriptor:
 class VGG(nn.Module):
     def forward(self, x):
         x = imagenet(x)
-        with torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16):
+        amp_device_type = x.device.type
+        amp_enabled = bool(amp_device_type == "cuda")
+        with torch.autocast(device_type=amp_device_type, enabled=amp_enabled, dtype=torch.bfloat16):
             feats = {}
             scale = 1
             for layer in self.layers:
@@ -184,7 +190,7 @@ class FineFeatures(nn.Module):
     def __new__(cls, cfg: Cfg):
         match cfg.type:
             case "vgg19":
-                return VGG19(cfg.patch_size, cfg.pretrained)
+                return VGG19(cfg.patch_size)
             case "vgg19bn":
                 return VGG19BN(cfg.patch_size, cfg.pretrained)
             case _:

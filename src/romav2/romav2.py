@@ -377,14 +377,14 @@ class RoMaV2(nn.Module):
             precision_BA = None
 
         preds = {
-            "warp_AB": warp_AB.clone(),
-            "confidence_AB": confidence_AB.clone(),
-            "overlap_AB": overlap_AB.clone(),
-            "precision_AB": precision_AB.clone(),
-            "warp_BA": warp_BA.clone() if warp_BA is not None else None,
-            "confidence_BA": confidence_BA.clone() if confidence_BA is not None else None,
-            "overlap_BA": overlap_BA.clone() if overlap_BA is not None else None,
-            "precision_BA": precision_BA.clone() if precision_BA is not None else None,
+            "warp_AB": warp_AB.detach(),
+            "confidence_AB": confidence_AB.detach(),
+            "overlap_AB": overlap_AB.detach(),
+            "precision_AB": precision_AB.detach(),
+            "warp_BA": warp_BA.detach() if warp_BA is not None else None,
+            "confidence_BA": confidence_BA.detach() if confidence_BA is not None else None,
+            "overlap_BA": overlap_BA.detach() if overlap_BA is not None else None,
+            "precision_BA": precision_BA.detach() if precision_BA is not None else None,
         }
         return preds
 
@@ -445,12 +445,26 @@ class RoMaV2(nn.Module):
         else:
             matches = matches_AB
             confidence = confidence_AB.reshape(-1)
-            precision = precision_AB.reshape(-1, 2, 2)
+            precision = precision_AB.reshape(-1, 2, 2) if precision_AB is not None else None
 
         expansion_factor = 4
         confidence = confidence * matches.abs().amax(dim=-1).le(1 - 1 / H_A).float()
+        confidence = torch.nan_to_num(confidence.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        positive = confidence > 0
+        if not bool(positive.any().item()):
+            confidence = torch.ones_like(confidence)
+            positive = confidence > 0
+
+        requested = max(1, int(expansion_factor * num_corresp))
+        available = int(positive.sum().item())
+        if available > 0:
+            first_stage_samples = min(requested, available)
+        else:
+            first_stage_samples = min(requested, int(confidence.numel()))
+        replacement_first_stage = False
+
         corresp_inds = torch.multinomial(
-            confidence, expansion_factor * num_corresp, replacement=False
+            confidence, first_stage_samples, replacement=replacement_first_stage
         )
         sampled_matches = matches[corresp_inds]
         sampled_confidence = confidence[corresp_inds]
@@ -460,13 +474,20 @@ class RoMaV2(nn.Module):
             sampled_precision = None
         # return sampled_matches, sampled_confidence
         density = kde(sampled_matches)
+        density = torch.nan_to_num(density.float(), nan=0.0, posinf=0.0, neginf=0.0)
 
         p = 1 / (density + 1)
         p[density < 10] = (
             1e-7  # Basically should have at least 10 perfect neighbours, or around 100 ok ones
         )
+        p = torch.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
+        if float(p.sum().item()) <= 0.0:
+            p = torch.ones_like(p)
+        balanced_count = min(int(num_corresp), int(len(sampled_confidence)))
         balanced_samples = torch.multinomial(
-            p, num_samples=min(num_corresp, len(sampled_confidence)), replacement=False
+            p,
+            num_samples=balanced_count,
+            replacement=balanced_count > int(p.numel()),
         )
         return (
             sampled_matches[balanced_samples],
@@ -542,10 +563,45 @@ class RoMaV2(nn.Module):
                 return torch.cat((x_A[inds_A], x_B[inds_B]), dim=-1)
 
 
-def kde(x: torch.Tensor, std: float = 0.1, half: bool = True) -> torch.Tensor:
-    # use a gaussian kernel to estimate density
-    if half:
-        x = x.half()
-    scores = (-(torch.cdist(x, x) ** 2) / (2 * std**2)).exp()
-    density = scores.sum(dim=-1)
+def kde(
+    x: torch.Tensor,
+    std: float = 0.1,
+    half: bool = True,
+    *,
+    max_reference_points: int = 8192,
+    chunk_size: int = 2048,
+) -> torch.Tensor:
+    """Gaussian-kernel density estimate with bounded memory.
+
+    For large point sets, density is estimated against a deterministic reference
+    subset and re-scaled to approximate the full sum. This keeps runtime/memory
+    bounded while preserving ranking quality for balanced sampling.
+    """
+    del half  # legacy arg kept for backwards compatibility
+    if std <= 0:
+        raise ValueError(f"std must be > 0, got {std}")
+    if x.ndim != 2:
+        raise ValueError(f"kde expects shape [N, D], got {tuple(x.shape)}")
+    n = int(x.shape[0])
+    if n == 0:
+        return x.new_zeros((0,), dtype=torch.float32)
+
+    x32 = x.float()
+    ref_count = min(max(1, int(max_reference_points)), n)
+    if ref_count == n:
+        refs = x32
+        scale = 1.0
+    else:
+        idx = torch.linspace(0, n - 1, ref_count, device=x32.device).long()
+        refs = x32.index_select(0, idx)
+        scale = float(n) / float(ref_count)
+
+    inv_two_sigma2 = -1.0 / (2.0 * float(std) * float(std))
+    density = x32.new_zeros((n,), dtype=torch.float32)
+    chunk = max(128, int(chunk_size))
+    for start in range(0, n, chunk):
+        stop = min(n, start + chunk)
+        dist = torch.cdist(x32[start:stop], refs)
+        scores = torch.exp(inv_two_sigma2 * (dist * dist))
+        density[start:stop] = scores.sum(dim=-1) * scale
     return density

@@ -8,6 +8,18 @@ import numpy as np
 
 _NORMALIZED_GRID_CACHE: dict[tuple[str, int | None, int, int], torch.Tensor] = {}
 _PIXEL_GRID_CACHE: dict[tuple[str, int | None, int, int], torch.Tensor] = {}
+_GRID_CACHE_MAX_ENTRIES = 32
+
+
+def _cache_put(
+    cache: dict[tuple[str, int | None, int, int], torch.Tensor],
+    key: tuple[str, int | None, int, int],
+    value: torch.Tensor,
+) -> None:
+    cache[key] = value
+    while len(cache) > _GRID_CACHE_MAX_ENTRIES:
+        oldest_key = next(iter(cache))
+        cache.pop(oldest_key, None)
 
 
 def _grid_cache_key(dev: torch.device, H: int, W: int) -> tuple[str, int | None, int, int]:
@@ -36,7 +48,7 @@ def get_normalized_grid(
         x = torch.linspace(-1 + 1 / W, 1 - 1 / W, W, device=dev)
         yx = torch.meshgrid(y, x, indexing="ij")
         base_grid = torch.stack((yx[1], yx[0]), dim=-1).unsqueeze(0)
-        _NORMALIZED_GRID_CACHE[key] = base_grid
+        _cache_put(_NORMALIZED_GRID_CACHE, key, base_grid)
     return base_grid.expand(B, -1, -1, -1)
 
 
@@ -55,7 +67,7 @@ def get_pixel_grid(
         x = torch.arange(W, device=dev, dtype=torch.float32) + 0.5
         yx = torch.meshgrid(y, x, indexing="ij")
         base_grid = torch.stack((yx[1], yx[0]), dim=-1).unsqueeze(0)
-        _PIXEL_GRID_CACHE[key] = base_grid
+        _cache_put(_PIXEL_GRID_CACHE, key, base_grid)
     return base_grid.expand(B, -1, -1, -1)
 
 

@@ -216,19 +216,37 @@ def parse_args() -> argparse.Namespace:
 
 
 def _box_filter_2d(src: np.ndarray, radius: int) -> np.ndarray:
-    """Fast O(N) box filter using cumulative sums (separable, two-pass)."""
+    """Fast O(N) box filter using cumulative sums (separable, two-pass).
+
+    Supports input shapes (H, W) and (H, W, C).
+    """
     ksize = 2 * radius + 1
 
-    # Horizontal pass via cumsum
-    padded = np.pad(src, ((0, 0), (radius + 1, radius)), mode="reflect")
-    cs = np.cumsum(padded, axis=1)
-    horiz = (cs[:, ksize:] - cs[:, :-ksize]) / ksize
+    if src.ndim == 2:
+        # Horizontal pass via cumsum
+        padded = np.pad(src, ((0, 0), (radius + 1, radius)), mode="reflect")
+        cs = np.cumsum(padded, axis=1, dtype=np.float32)
+        horiz = (cs[:, ksize:] - cs[:, :-ksize]) / ksize
 
-    # Vertical pass via cumsum
-    padded = np.pad(horiz, ((radius + 1, radius), (0, 0)), mode="reflect")
-    cs = np.cumsum(padded, axis=0)
-    result = (cs[ksize:, :] - cs[:-ksize, :]) / ksize
-    return result
+        # Vertical pass via cumsum
+        padded = np.pad(horiz, ((radius + 1, radius), (0, 0)), mode="reflect")
+        cs = np.cumsum(padded, axis=0, dtype=np.float32)
+        result = (cs[ksize:, :] - cs[:-ksize, :]) / ksize
+        return result.astype(np.float32, copy=False)
+
+    if src.ndim == 3:
+        # Horizontal pass via cumsum
+        padded = np.pad(src, ((0, 0), (radius + 1, radius), (0, 0)), mode="reflect")
+        cs = np.cumsum(padded, axis=1, dtype=np.float32)
+        horiz = (cs[:, ksize:, :] - cs[:, :-ksize, :]) / ksize
+
+        # Vertical pass via cumsum
+        padded = np.pad(horiz, ((radius + 1, radius), (0, 0), (0, 0)), mode="reflect")
+        cs = np.cumsum(padded, axis=0, dtype=np.float32)
+        result = (cs[ksize:, :, :] - cs[:-ksize, :, :]) / ksize
+        return result.astype(np.float32, copy=False)
+
+    raise ValueError(f"_box_filter_2d expects 2D or 3D input, got shape {src.shape}")
 
 
 def _guided_filter(
@@ -247,21 +265,34 @@ def _guided_filter(
     -------
     (H, W) float32 filtered output.
     """
+    if guide.ndim != 2:
+        raise ValueError(f"guide must be 2D, got shape {guide.shape}")
+    if src.ndim == 2:
+        src_v = src[..., None]
+        squeeze = True
+    elif src.ndim == 3:
+        src_v = src
+        squeeze = False
+    else:
+        raise ValueError(f"src must be 2D or 3D, got shape {src.shape}")
+
     mean_g = _box_filter_2d(guide, radius)
-    mean_s = _box_filter_2d(src, radius)
     corr_gg = _box_filter_2d(guide * guide, radius)
-    corr_gs = _box_filter_2d(guide * src, radius)
-
     var_g = corr_gg - mean_g * mean_g
-    cov_gs = corr_gs - mean_g * mean_s
 
-    a = cov_gs / (var_g + eps)
-    b = mean_s - a * mean_g
+    mean_s = _box_filter_2d(src_v, radius)
+    corr_gs = _box_filter_2d(guide[..., None] * src_v, radius)
+    cov_gs = corr_gs - mean_g[..., None] * mean_s
+
+    a = cov_gs / (var_g[..., None] + eps)
+    b = mean_s - a * mean_g[..., None]
 
     mean_a = _box_filter_2d(a, radius)
     mean_b = _box_filter_2d(b, radius)
-
-    return (mean_a * guide + mean_b).astype(np.float32)
+    out = (mean_a * guide[..., None] + mean_b).astype(np.float32, copy=False)
+    if squeeze:
+        return out[..., 0]
+    return out
 
 
 def _rgb_to_lab(rgb_uint8: np.ndarray) -> np.ndarray:
@@ -480,10 +511,16 @@ def _fit_within_size(w: int, h: int, max_side: int) -> tuple[int, int]:
     return out_w, out_h
 
 
-def _resize_float2d_bilinear(src: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
-    t = torch.from_numpy(src.astype(np.float32, copy=False)).unsqueeze(0).unsqueeze(0)
-    out = F.interpolate(t, size=(out_h, out_w), mode="bilinear", align_corners=False)[0, 0]
-    return out.numpy().astype(np.float32, copy=False)
+def _resize_float_bilinear(src: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    if src.ndim == 2:
+        t = torch.from_numpy(src.astype(np.float32, copy=False)).unsqueeze(0).unsqueeze(0)
+        out = F.interpolate(t, size=(out_h, out_w), mode="bilinear", align_corners=False)[0, 0]
+        return out.numpy().astype(np.float32, copy=False)
+    if src.ndim == 3:
+        t = torch.from_numpy(np.transpose(src.astype(np.float32, copy=False), (2, 0, 1))).unsqueeze(0)
+        out = F.interpolate(t, size=(out_h, out_w), mode="bilinear", align_corners=False)[0]
+        return np.transpose(out.numpy(), (1, 2, 0)).astype(np.float32, copy=False)
+    raise ValueError(f"_resize_float_bilinear expects 2D or 3D input, got shape {src.shape}")
 
 
 def _guided_filter_with_mp_limit(
@@ -504,10 +541,10 @@ def _guided_filter_with_mp_limit(
     out_w = max(64, int(round(w * scale)))
     radius_ds = max(1, int(round(radius * scale)))
 
-    guide_ds = _resize_float2d_bilinear(guide, out_h, out_w)
-    src_ds = _resize_float2d_bilinear(src, out_h, out_w)
+    guide_ds = _resize_float_bilinear(guide, out_h, out_w)
+    src_ds = _resize_float_bilinear(src, out_h, out_w)
     filtered_ds = _guided_filter(guide_ds, src_ds, radius_ds, eps)
-    return _resize_float2d_bilinear(filtered_ds, h, w)
+    return _resize_float_bilinear(filtered_ds, h, w)
 
 
 def _mae_rgb_uint8(a: np.ndarray, b: np.ndarray) -> float:
@@ -1211,24 +1248,12 @@ def main() -> int:
         warp_np = warp_ab_full.detach().cpu().numpy()  # (H, W, 2)
 
         # Smooth the RAW warp (not the confidence-masked one)
-        warp_smooth_np = np.stack(
-            [
-                _guided_filter_with_mp_limit(
-                    guide=ref_gray,
-                    src=warp_np[..., 0],
-                    radius=gf_radius,
-                    eps=args.guided_filter_eps,
-                    max_megapixels=float(args.filter_max_megapixels),
-                ),
-                _guided_filter_with_mp_limit(
-                    guide=ref_gray,
-                    src=warp_np[..., 1],
-                    radius=gf_radius,
-                    eps=args.guided_filter_eps,
-                    max_megapixels=float(args.filter_max_megapixels),
-                ),
-            ],
-            axis=-1,
+        warp_smooth_np = _guided_filter_with_mp_limit(
+            guide=ref_gray,
+            src=warp_np,
+            radius=gf_radius,
+            eps=args.guided_filter_eps,
+            max_megapixels=float(args.filter_max_megapixels),
         )
         warp_smooth_full = torch.from_numpy(warp_smooth_np).to(roma_device)
 
@@ -1385,22 +1410,14 @@ def main() -> int:
             # Smooth donor chroma with reference luminance as guide.
             ref_gray = np.asarray(ref_img.convert("L"), dtype=np.float32) / 255.0
             donor_lab = _rgb_to_lab(donor_rgb)
-            donor_a = _guided_filter_with_mp_limit(
+            donor_ab = _guided_filter_with_mp_limit(
                 guide=ref_gray,
-                src=donor_lab[..., 1].astype(np.float32),
+                src=donor_lab[..., 1:3].astype(np.float32, copy=False),
                 radius=chroma_radius,
                 eps=args.guided_filter_eps,
                 max_megapixels=float(args.filter_max_megapixels),
             )
-            donor_b = _guided_filter_with_mp_limit(
-                guide=ref_gray,
-                src=donor_lab[..., 2].astype(np.float32),
-                radius=chroma_radius,
-                eps=args.guided_filter_eps,
-                max_megapixels=float(args.filter_max_megapixels),
-            )
-            donor_lab[..., 1] = donor_a
-            donor_lab[..., 2] = donor_b
+            donor_lab[..., 1:3] = donor_ab
             donor_rgb = _lab_to_rgb(donor_lab)
             print(f"[INFO] Chrominance guided filter: radius={chroma_radius}")
 
