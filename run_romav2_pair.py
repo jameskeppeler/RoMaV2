@@ -1309,12 +1309,74 @@ def main() -> int:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    final_rgb: np.ndarray | None = None
+    in_bounds = warp_ab_full.abs().amax(dim=-1, keepdim=True).le(1.0).float()
+    if overlap_full is not None:
+        validity = overlap_full.unsqueeze(-1) * in_bounds
+    else:
+        validity = in_bounds
+    validity_chw = validity.permute(2, 0, 1)
+    warped_src_masked = warped_src * validity_chw + (1.0 - validity_chw)
+    warped_src_masked_path = args.outdir / "warped_src_to_ref_masked_by_overlap.png"
+    _save_chw_tensor_png(warped_src_masked, warped_src_masked_path)
+    output_files.append(warped_src_masked_path)
+
+    regularized_output_path: Path | None = None
+    warped_regularized_rgb: np.ndarray | None = None
+    warped_regularized_tensor: torch.Tensor | None = None
+    if overlap_full is not None and effective_regularize_fallback != "none":
+        tau = float(args.regularize_overlap_thresh)
+        denom = max(1e-6, 1.0 - tau)
+        alpha = ((overlap_full - tau) / denom).clamp(0.0, 1.0).unsqueeze(0)
+
+        if effective_regularize_fallback == "identity":
+            identity_theta = torch.tensor(
+                [[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]],
+                dtype=src_tensor.dtype,
+                device=src_tensor.device,
+            )
+            identity_grid = F.affine_grid(
+                identity_theta,
+                size=(1, 3, ref_h, ref_w),
+                align_corners=False,
+            )
+            fallback_img = F.grid_sample(
+                src_tensor,
+                identity_grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=False,
+            )[0]
+        elif effective_regularize_fallback == "reference":
+            fallback_img = ref_tensor
+        else:
+            fallback_img = warped_src
+
+        warped_regularized = alpha * warped_src + (1.0 - alpha) * fallback_img
+        warped_regularized_tensor = warped_regularized
+        warped_regularized_rgb = _tensor_chw_to_uint8(warped_regularized)
+        regularized_output_path = args.outdir / "warped_src_to_ref_regularized.png"
+        _save_chw_tensor_png(warped_regularized, regularized_output_path)
+        output_files.append(regularized_output_path)
+
+        alpha_img = (alpha.squeeze(0).detach().cpu().numpy() * 255.0).round().astype(np.uint8)
+        alpha_path = args.outdir / "regularization_alpha.png"
+        Image.fromarray(alpha_img).save(alpha_path)
+        output_files.append(alpha_path)
+
     # --- Photoshop-style Color blend transfer ---
     stage_start = perf_counter()
-    final_rgb: np.ndarray | None = None
     if not args.no_color_transfer:
-        # Use the best available warped image: smooth > raw
-        color_donor = warped_src_smooth if warped_src_smooth is not None else warped_src
+        # Prefer regularized warp donor, then smooth, then raw.
+        if warped_regularized_tensor is not None:
+            color_donor = warped_regularized_tensor
+            donor_stage = "regularized"
+        elif warped_src_smooth is not None:
+            color_donor = warped_src_smooth
+            donor_stage = "smooth"
+        else:
+            color_donor = warped_src
+            donor_stage = "raw"
         donor_rgb = _tensor_chw_to_uint8(color_donor)
         ref_rgb = np.asarray(ref_img.convert("RGB"), dtype=np.uint8)
 
@@ -1354,62 +1416,11 @@ def main() -> int:
 
         print(
             "[INFO] Saved Photoshop-style Color blend result "
-            f"(opacity={float(args.color_opacity):.2f}) -> final_colorized.png"
+            f"(donor={donor_stage}, opacity={float(args.color_opacity):.2f}) -> final_colorized.png"
         )
     else:
         print("[INFO] Color transfer disabled (--no-color-transfer).")
     print(f"[TIMING] Color transfer stage: {perf_counter() - stage_start:.2f}s")
-    in_bounds = warp_ab_full.abs().amax(dim=-1, keepdim=True).le(1.0).float()
-    if overlap_full is not None:
-        validity = overlap_full.unsqueeze(-1) * in_bounds
-    else:
-        validity = in_bounds
-    validity_chw = validity.permute(2, 0, 1)
-    warped_src_masked = warped_src * validity_chw + (1.0 - validity_chw)
-    warped_src_masked_path = args.outdir / "warped_src_to_ref_masked_by_overlap.png"
-    _save_chw_tensor_png(warped_src_masked, warped_src_masked_path)
-    output_files.append(warped_src_masked_path)
-
-    regularized_output_path: Path | None = None
-    warped_regularized_rgb: np.ndarray | None = None
-    if overlap_full is not None and effective_regularize_fallback != "none":
-        tau = float(args.regularize_overlap_thresh)
-        denom = max(1e-6, 1.0 - tau)
-        alpha = ((overlap_full - tau) / denom).clamp(0.0, 1.0).unsqueeze(0)
-
-        if effective_regularize_fallback == "identity":
-            identity_theta = torch.tensor(
-                [[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]],
-                dtype=src_tensor.dtype,
-                device=src_tensor.device,
-            )
-            identity_grid = F.affine_grid(
-                identity_theta,
-                size=(1, 3, ref_h, ref_w),
-                align_corners=False,
-            )
-            fallback_img = F.grid_sample(
-                src_tensor,
-                identity_grid,
-                mode="bilinear",
-                padding_mode="zeros",
-                align_corners=False,
-            )[0]
-        elif effective_regularize_fallback == "reference":
-            fallback_img = ref_tensor
-        else:
-            fallback_img = warped_src
-
-        warped_regularized = alpha * warped_src + (1.0 - alpha) * fallback_img
-        warped_regularized_rgb = _tensor_chw_to_uint8(warped_regularized)
-        regularized_output_path = args.outdir / "warped_src_to_ref_regularized.png"
-        _save_chw_tensor_png(warped_regularized, regularized_output_path)
-        output_files.append(regularized_output_path)
-
-        alpha_img = (alpha.squeeze(0).detach().cpu().numpy() * 255.0).round().astype(np.uint8)
-        alpha_path = args.outdir / "regularization_alpha.png"
-        Image.fromarray(alpha_img).save(alpha_path)
-        output_files.append(alpha_path)
 
     stage_start = perf_counter()
     print("[INFO] Building before/after diagnostic images ...")
