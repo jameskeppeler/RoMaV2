@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import shutil
 import sys
 import time
 from datetime import datetime
@@ -151,10 +152,12 @@ class PhotoColorizerQt(QMainWindow):
         self.repo_root = Path(__file__).resolve().parent
         self.runner_script = self.repo_root / "run_romav2_pair.py"
         self.default_outdir = self.repo_root / "outputs" / f"colorize_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.color_step1_dir = self.repo_root / "color_step_1"
         self.browser_profile_dir = self.repo_root / ".qt_browser_profile"
         self.prewarm_cache_dir = self.repo_root / ".roma_prewarm_cache"
         self.browser_profile_dir.mkdir(parents=True, exist_ok=True)
         self.prewarm_cache_dir.mkdir(parents=True, exist_ok=True)
+        self.color_step1_dir.mkdir(parents=True, exist_ok=True)
 
         self.process: QProcess | None = None
         self.prewarm_process: QProcess | None = None
@@ -174,6 +177,9 @@ class PhotoColorizerQt(QMainWindow):
         self._auto_get_c1_polling = False
         self._auto_get_c1_poll_deadline_monotonic: float | None = None
         self._auto_get_c1_poll_attempt = 0
+        self._full_workflow_active = False
+        self._full_workflow_waiting_for_c1 = False
+        self._full_workflow_pending_delete = False
         self._run_started_monotonic: float | None = None
         self._last_process_output_monotonic: float | None = None
         self._last_run_watchdog_log_monotonic: float | None = None
@@ -305,7 +311,7 @@ class PhotoColorizerQt(QMainWindow):
         layout = QVBoxLayout(group)
         quick_label = QLabel(
             "Use the C1 Workflow panel on the left:\n"
-            "Choose B&W (auto-attach + auto-send + auto-Get C1) -> Colorize."
+            "Choose B&W (select file only), then click Colorize for full automation."
         )
         quick_label.setWordWrap(True)
         layout.addWidget(quick_label)
@@ -442,8 +448,9 @@ class PhotoColorizerQt(QMainWindow):
         layout.setSpacing(6)
 
         note = QLabel(
-            "Step 1: Choose a B&W photo. The app auto-attaches, auto-runs Color Step 1, "
-            "and auto-runs Get C1 when ChatGPT finishes. Then click Colorize."
+            "Step 1: Choose a B&W photo (select only). "
+            "Step 2: Click Colorize to run the full flow: upload photo, send prompt, auto-download/import C1, "
+            "auto-delete chat, then run overlay. Downloaded C1 files are moved to color_step_1."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -489,7 +496,7 @@ class PhotoColorizerQt(QMainWindow):
 
         self.run_btn = QPushButton("Colorize")
         self.run_btn.setObjectName("primaryAction")
-        self.run_btn.clicked.connect(self._start_run)
+        self.run_btn.clicked.connect(self._start_full_workflow)
         seq.addWidget(self.run_btn, 0, 0, 1, 2)
 
         self.stop_btn = QPushButton("Stop")
@@ -761,17 +768,17 @@ class PhotoColorizerQt(QMainWindow):
 
         prompt_ok = bool(self.prompt_box.toPlainText().strip()) if hasattr(self, "prompt_box") else False
         runner_ok = self.runner_script.exists()
-        run_ready = bw_ok and color_ok and runner_ok
+        run_ready = bw_ok and prompt_ok and runner_ok
 
         self._set_step_label(self.step1_state, "B&W selected" if bw_ok else "Select B&W image", bw_ok)
         self._set_step_label(
             self.step2_state,
-            "Colorized image imported" if color_ok else "Import/download colorized image",
-            color_ok and prompt_ok,
+            "Colorized image imported" if color_ok else "C1 will be generated during Colorize",
+            color_ok or (bw_ok and prompt_ok),
         )
         self._set_step_label(
             self.step4_state,
-            "Ready to run" if run_ready else "Need B&W + AI Colorized image",
+            "Ready to run full workflow" if run_ready else "Need B&W image + prompt",
             run_ready,
         )
         warmup_text = f"Warm model cache for '{setting}'"
@@ -782,8 +789,8 @@ class PhotoColorizerQt(QMainWindow):
         self._set_step_label(self.warmup_state, warmup_text, warmup_ok)
 
         running = self.process is not None and self.process.state() != QProcess.NotRunning
-        if hasattr(self, "run_btn") and not running:
-            self.run_btn.setEnabled(run_ready)
+        if hasattr(self, "run_btn"):
+            self.run_btn.setEnabled(run_ready and (not running) and (not self._full_workflow_active))
 
     def _show_results_tab(self) -> None:
         if hasattr(self, "left_tabs"):
@@ -826,266 +833,335 @@ class PhotoColorizerQt(QMainWindow):
         if confirm != QMessageBox.Yes:
             return
 
+        self._delete_current_chat_automated()
+
+    def _delete_current_chat_automated(self, *, done=None) -> None:
+        current = self.browser.url().toString().lower() if hasattr(self, "browser") else ""
+        if "chatgpt.com" not in current:
+            self._append_log("[WARN] Delete Chat skipped: ChatGPT is not open in the embedded browser.")
+            if done is not None:
+                done(False)
+            return
         self._append_log("[INFO] Delete Chat: attempting to delete current ChatGPT conversation.")
-        self._attempt_delete_current_chat(retries=14, delay_ms=500)
+        self._attempt_delete_current_chat(retries=22, delay_ms=600, done=done)
 
     @staticmethod
     def _chatgpt_delete_chat_js() -> str:
         return """
 (() => {
   try {
-  const visible = (el) => {
-    if (!el) return false;
-    const style = window.getComputedStyle(el);
-    if (style.display === 'none' || style.visibility === 'hidden') return false;
-    const r = el.getBoundingClientRect();
-    return r.width > 0 && r.height > 0;
-  };
-  const textOf = (n) => (
-    ((n.innerText || '') + ' ' +
-     (n.getAttribute?.('aria-label') || '') + ' ' +
-     (n.getAttribute?.('title') || '')).toLowerCase().trim()
-  );
-  const testidOf = (n) => (n.getAttribute?.('data-testid') || '').toLowerCase();
-  const disabled = (n) => !!(n.disabled || n.getAttribute?.('aria-disabled') === 'true');
-  const tryClick = (el) => {
-    if (!el || disabled(el)) return false;
-    try { el.focus?.(); } catch {}
-    try { el.click(); return true; } catch {}
-    return false;
-  };
-  const syncRequest = (method, url, bodyObj) => {
-    try {
-      const xhr = new XMLHttpRequest();
-      xhr.open(method, url, false);
-      xhr.withCredentials = true;
-      xhr.setRequestHeader('accept', 'application/json, text/plain, */*');
-      if (bodyObj != null) {
-        xhr.setRequestHeader('content-type', 'application/json');
-      }
-      xhr.send(bodyObj != null ? JSON.stringify(bodyObj) : null);
-      return { ok: xhr.status >= 200 && xhr.status < 300, status: xhr.status };
-    } catch (err) {
-      return { ok: false, status: 0, error: String(err) };
-    }
-  };
-  const isDeleteLabel = (t) => {
-    if (!t) return false;
-    if (t.includes('delete chat')) return true;
-    if (t === 'delete') return true;
-    if (t.startsWith('delete ')) return true;
-    if (t.includes('remove chat')) return true;
-    return false;
-  };
-  const isBadDelete = (t) =>
-    t.includes('delete all') || t.includes('all chats') || t.includes('account') || t.includes('project');
-  const pathParts = (window.location.pathname || '').split('/').filter(Boolean);
-  let convId = null;
-  const cIdx = pathParts.indexOf('c');
-  if (cIdx >= 0 && pathParts[cIdx + 1]) {
-    convId = String(pathParts[cIdx + 1]).toLowerCase();
-  }
-  const debug = {
-    path: window.location.pathname || '',
-    convId: convId,
-    dialogCount: 0,
-    deleteActionCount: 0,
-    rowMenuCount: 0,
-    globalMenuCount: 0,
-    api: []
-  };
-
-  if (!convId) {
-    return { ok: false, final: false, reason: 'current_chat_not_detected', debug };
-  }
-
-  // 1) Try direct API deletion/hide first (most reliable when UI selectors drift).
-  const apiCalls = [
-    { key: 'patch_is_visible_false', method: 'PATCH', url: `/backend-api/conversation/${convId}`, body: { is_visible: false } },
-    { key: 'patch_is_archived_true', method: 'PATCH', url: `/backend-api/conversation/${convId}`, body: { is_archived: true } },
-    { key: 'delete_conversation', method: 'DELETE', url: `/backend-api/conversation/${convId}`, body: null },
-  ];
-  for (const a of apiCalls) {
-    const r = syncRequest(a.method, a.url, a.body);
-    debug.api.push({ key: a.key, status: r.status, ok: !!r.ok });
-    if (r.ok) {
-      return { ok: true, final: true, via: `api_${a.key}`, status: r.status, debug };
-    }
-  }
-
-  // 2) Confirm delete in an open modal/dialog first.
-  const dialogs = Array.from(
-    document.querySelectorAll('[role="dialog"],[aria-modal="true"],div[data-state="open"]')
-  ).filter(visible);
-  debug.dialogCount = dialogs.length;
-  for (const d of dialogs) {
-    const nodes = Array.from(d.querySelectorAll('button,[role="button"],[role="menuitem"],a')).filter(visible);
-    const candidates = nodes
-      .map((n) => {
-        const t = textOf(n);
-        let score = 0;
-        if (t.includes('delete chat')) score += 9;
-        if (t === 'delete' || t.startsWith('delete ')) score += 7;
-        if (t.includes('conversation')) score += 2;
-        if (t.includes('chat')) score += 2;
-        if (t.includes('confirm')) score += 2;
-        if (isBadDelete(t)) score -= 40;
-        if (t.includes('cancel') || t.includes('keep')) score -= 50;
-        return { n, t, score };
-      })
-      .filter((x) => x.score > 0)
-      .sort((a, b) => a.score - b.score);
-    if (candidates.length > 0) {
-      const target = candidates[candidates.length - 1];
-      if (tryClick(target.n)) {
-        return { ok: true, final: true, via: 'confirm_dialog_button', label: target.t, debug };
-      }
-    }
-  }
-
-  // 3) Click a visible delete action (usually in an actions menu).
-  const actionNodes = Array.from(
-    document.querySelectorAll('button,[role="menuitem"],[role="button"],a')
-  ).filter(visible);
-  const deleteActions = actionNodes
-    .map((n) => {
-      const t = textOf(n);
-      const testid = testidOf(n);
-      let score = 0;
-      if (isDeleteLabel(t)) score += 9;
-      if (testid.includes('delete')) score += 7;
-      if (t.includes('conversation')) score += 2;
-      if (t.includes('chat')) score += 2;
-      if (isBadDelete(t)) score -= 20;
-      return { n, t, score };
-    })
-    .filter((x) => x.score > 0)
-    .sort((a, b) => a.score - b.score);
-  debug.deleteActionCount = deleteActions.length;
-  if (deleteActions.length > 0) {
-    const target = deleteActions[deleteActions.length - 1];
-    if (tryClick(target.n)) {
-      return { ok: true, final: false, via: 'delete_action_clicked', label: target.t, debug };
-    }
-  }
-
-  // 4) Open menu near the currently active conversation row when possible.
-  const anchors = Array.from(document.querySelectorAll('a[href*="/c/"]'));
-  const exact = anchors.find((a) => {
-    const href = a.getAttribute('href') || '';
-    return href.includes(`/c/${convId}`);
-  });
-  if (exact) {
-    try {
-      exact.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
-      exact.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-    } catch {}
-    const row =
-      exact.closest('[data-testid*="history-item"],li,[role="listitem"],div') ||
-      exact.parentElement;
-    if (row) {
+    var toLower = function (v) { return String(v || "").toLowerCase(); };
+    var visible = function (el) {
+      if (!el || !el.getBoundingClientRect) return false;
+      var style = window.getComputedStyle(el);
+      if (!style || style.display === "none" || style.visibility === "hidden") return false;
+      var r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    };
+    var textOf = function (el) {
+      var t = "";
+      try { t += " " + (el.innerText || ""); } catch (err) {}
+      try { t += " " + (el.getAttribute("aria-label") || ""); } catch (err) {}
+      try { t += " " + (el.getAttribute("title") || ""); } catch (err) {}
+      try { t += " " + (el.getAttribute("data-testid") || ""); } catch (err) {}
+      return toLower(t).trim();
+    };
+    var testidOf = function (el) {
+      try { return toLower(el.getAttribute("data-testid") || ""); } catch (err) {}
+      return "";
+    };
+    var isDisabled = function (el) {
       try {
-        row.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
-        row.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-      } catch {}
-      const rowButtons = Array.from(
-        row.querySelectorAll('button,[role="button"],[data-testid],a')
-      ).filter(visible);
-      const rankedRow = rowButtons
-        .map((n, idx) => {
-          const t = textOf(n);
-          const testid = testidOf(n);
-          let score = 0;
-          if (n.getAttribute?.('aria-haspopup') === 'menu') score += 8;
-          if (t.includes('more') || t.includes('option') || t.includes('action') || t.includes('menu')) score += 6;
-          if (testid.includes(convId)) score += 8;
-          if (testid.includes('more') || testid.includes('menu') || testid.includes('action') || testid.includes('overflow') || testid.includes('options')) score += 5;
-          if (t.includes('...') || t.includes('ellipsis')) score += 2;
-          return { n, idx, score };
-        })
-        .filter((x) => x.score > 0)
-        .sort((a, b) => (a.score - b.score) || (a.idx - b.idx));
-      debug.rowMenuCount = rankedRow.length;
-      if (rankedRow.length > 0) {
-        const target = rankedRow[rankedRow.length - 1];
-        if (tryClick(target.n)) {
-          return { ok: true, final: false, via: 'opened_current_chat_row_menu', debug };
+        return !!(el.disabled || el.getAttribute("aria-disabled") === "true");
+      } catch (err) {
+        return false;
+      }
+    };
+    var tryClick = function (el) {
+      if (!el || isDisabled(el)) return false;
+      try { if (el.focus) el.focus(); } catch (err) {}
+      try { el.click(); return true; } catch (err) {}
+      return false;
+    };
+    var has = function (text, needle) { return text.indexOf(needle) >= 0; };
+    var isBadDelete = function (t) {
+      return has(t, "delete all") || has(t, "all chats") || has(t, "account") || has(t, "project");
+    };
+    var scoreDelete = function (node) {
+      var t = textOf(node);
+      var testid = testidOf(node);
+      var score = 0;
+      if (has(t, "delete chat")) score += 12;
+      if (t === "delete" || t.indexOf("delete ") === 0) score += 9;
+      if (has(t, "remove chat")) score += 6;
+      if (has(t, "conversation")) score += 2;
+      if (has(t, "chat")) score += 2;
+      if (has(testid, "delete")) score += 6;
+      if (isBadDelete(t)) score -= 100;
+      return score;
+    };
+    var scoreMenu = function (node, convId) {
+      var t = textOf(node);
+      var testid = testidOf(node);
+      var score = 0;
+      try {
+        if (node.getAttribute("aria-haspopup") === "menu") score += 8;
+      } catch (err) {}
+      if (has(t, "more")) score += 6;
+      if (has(t, "option")) score += 6;
+      if (has(t, "action")) score += 5;
+      if (has(t, "menu")) score += 4;
+      if (has(t, "...") || has(t, "ellipsis")) score += 2;
+      if (has(testid, "more") || has(testid, "menu") || has(testid, "action") || has(testid, "overflow") || has(testid, "options")) score += 5;
+      if (convId && has(testid, toLower(convId))) score += 8;
+      return score;
+    };
+    var pickBest = function (nodes, scoreFn) {
+      var best = null;
+      var bestScore = -9999;
+      for (var i = 0; i < nodes.length; i += 1) {
+        var n = nodes[i];
+        if (!visible(n)) continue;
+        var s = scoreFn(n);
+        if (s > bestScore) {
+          bestScore = s;
+          best = n;
+        }
+      }
+      return { node: best, score: bestScore };
+    };
+    var path = String((window.location && window.location.pathname) || "");
+    var href = String((window.location && window.location.href) || "");
+    var m = path.match(/\\/c\\/([^\\/?#]+)/i) || href.match(/\\/c\\/([^\\/?#]+)/i);
+    var convId = m ? String(m[1]) : "";
+    if (!convId) {
+      var activeLink = document.querySelector("a[aria-current='page'][href*='/c/'],a[href*='/c/'][data-active='true']");
+      if (activeLink) {
+        var activeHref = String(activeLink.getAttribute("href") || "");
+        var activeMatch = activeHref.match(/\\/c\\/([^\\/?#]+)/i);
+        if (activeMatch) convId = String(activeMatch[1]);
+      }
+    }
+    var debug = {
+      path: path,
+      convId: convId,
+      dialogCount: 0,
+      deleteActionCount: 0,
+      rowMenuCount: 0,
+      globalMenuCount: 0,
+      apiStatuses: ""
+    };
+
+    // 1) Direct API calls first (when conversation id is known).
+    var apiStatuses = [];
+    if (convId) {
+      var apiCalls = [
+        { key: "patch_is_visible_false", method: "PATCH", url: "/backend-api/conversation/" + convId, body: { is_visible: false } },
+        { key: "patch_is_archived_true", method: "PATCH", url: "/backend-api/conversation/" + convId, body: { is_archived: true } },
+        { key: "delete_conversation", method: "DELETE", url: "/backend-api/conversation/" + convId, body: null }
+      ];
+      for (var ai = 0; ai < apiCalls.length; ai += 1) {
+        var a = apiCalls[ai];
+        try {
+          var xhr = new XMLHttpRequest();
+          xhr.open(a.method, a.url, false);
+          xhr.withCredentials = true;
+          xhr.setRequestHeader("accept", "application/json, text/plain, */*");
+          if (a.body !== null) {
+            xhr.setRequestHeader("content-type", "application/json");
+            xhr.send(JSON.stringify(a.body));
+          } else {
+            xhr.send(null);
+          }
+          apiStatuses.push(a.key + ":" + String(xhr.status || 0));
+          if (xhr.status >= 200 && xhr.status < 300) {
+            debug.apiStatuses = apiStatuses.join(",");
+            return JSON.stringify({ ok: true, final: true, via: "api_" + a.key, status: xhr.status, debug: debug });
+          }
+        } catch (err) {
+          apiStatuses.push(a.key + ":error");
+        }
+      }
+      debug.apiStatuses = apiStatuses.join(",");
+    } else {
+      debug.apiStatuses = "conv_id_missing";
+    }
+
+    // 2) Confirm modal already open.
+    var dialogs = document.querySelectorAll('[role="dialog"],[aria-modal="true"],div[data-state="open"]');
+    var visibleDialogs = [];
+    for (var di = 0; di < dialogs.length; di += 1) {
+      if (visible(dialogs[di])) visibleDialogs.push(dialogs[di]);
+    }
+    debug.dialogCount = visibleDialogs.length;
+    for (var dj = 0; dj < visibleDialogs.length; dj += 1) {
+      var d = visibleDialogs[dj];
+      var nodes = d.querySelectorAll("button,[role='button'],[role='menuitem'],a");
+      var choice = pickBest(nodes, scoreDelete);
+      if (choice.node && choice.score > 0 && tryClick(choice.node)) {
+        return JSON.stringify({ ok: true, final: true, via: "confirm_dialog_button", label: textOf(choice.node), debug: debug });
+      }
+    }
+
+    // 3) Click an already-visible delete action.
+    var actionNodes = document.querySelectorAll("button,[role='menuitem'],[role='button'],a");
+    var deleteCandidates = [];
+    for (var i = 0; i < actionNodes.length; i += 1) {
+      if (!visible(actionNodes[i])) continue;
+      if (scoreDelete(actionNodes[i]) > 0) deleteCandidates.push(actionNodes[i]);
+    }
+    debug.deleteActionCount = deleteCandidates.length;
+    var deleteChoice = pickBest(deleteCandidates, scoreDelete);
+    if (deleteChoice.node && deleteChoice.score > 0 && tryClick(deleteChoice.node)) {
+      return JSON.stringify({ ok: true, final: false, via: "delete_action_clicked", label: textOf(deleteChoice.node), debug: debug });
+    }
+
+    // 4) Open menu on current chat row when possible.
+    var targetLink = null;
+    if (convId) {
+      var links = document.querySelectorAll("a[href*='/c/']");
+      var convNeedle = "/c/" + toLower(convId);
+      for (var li = 0; li < links.length; li += 1) {
+        var linkHref = toLower(links[li].getAttribute("href") || "");
+        if (linkHref.indexOf(convNeedle) >= 0) {
+          targetLink = links[li];
+          break;
         }
       }
     }
-  }
-
-  // 5) If sidebar is collapsed, try opening it.
-  const sidebarToggle = Array.from(document.querySelectorAll('button,[role="button"]')).find((n) => {
-    const t = textOf(n);
-    return t.includes('open sidebar') || t.includes('show sidebar') || t.includes('toggle sidebar');
-  });
-  if (sidebarToggle && tryClick(sidebarToggle)) {
-    return { ok: true, final: false, via: 'opened_sidebar', debug };
-  }
-
-  // 6) Open a likely "more/options" menu globally.
-  const menuButtons = Array.from(
-    document.querySelectorAll('button,[role="button"],[data-testid],a')
-  ).filter(visible);
-  const menuCandidates = menuButtons
-    .map((n, idx) => {
-      const t = textOf(n);
-      const testid = testidOf(n);
-      let score = 0;
-      if (n.getAttribute?.('aria-haspopup') === 'menu') score += 6;
-      if (t.includes('more')) score += 5;
-      if (t.includes('option')) score += 5;
-      if (t.includes('action')) score += 5;
-      if (t.includes('menu')) score += 3;
-      if (t.includes('...') || t.includes('ellipsis')) score += 2;
-      if (testid.includes('more') || testid.includes('menu') || testid.includes('action') || testid.includes('overflow')) score += 4;
-      return { n, idx, score };
-    })
-    .filter((x) => x.score > 0)
-    .sort((a, b) => (a.score - b.score) || (a.idx - b.idx));
-  debug.globalMenuCount = menuCandidates.length;
-  if (menuCandidates.length > 0) {
-    const target = menuCandidates[menuCandidates.length - 1];
-    if (tryClick(target.n)) {
-      return { ok: true, final: false, via: 'opened_actions_menu', debug };
+    if (targetLink) {
+      try {
+        targetLink.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
+        targetLink.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+      } catch (err) {}
+      var row = null;
+      try { row = targetLink.closest("[data-testid*='history-item'],li,[role='listitem'],div"); } catch (err) {}
+      if (!row) row = targetLink.parentElement;
+      if (row) {
+        try {
+          row.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
+          row.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+        } catch (err) {}
+        var rowButtons = row.querySelectorAll("button,[role='button'],[data-testid],a");
+        var rowChoice = pickBest(rowButtons, function (n) { return scoreMenu(n, convId); });
+        debug.rowMenuCount = rowButtons.length;
+        if (rowChoice.node && rowChoice.score > 0 && tryClick(rowChoice.node)) {
+          return JSON.stringify({ ok: true, final: false, via: "opened_current_chat_row_menu", debug: debug });
+        }
+      }
     }
-  }
 
-  return { ok: false, final: false, reason: 'delete_controls_not_found', debug };
+    // 5) Open sidebar if collapsed.
+    var sidebarButtons = document.querySelectorAll("button,[role='button']");
+    var sidebarChoice = pickBest(sidebarButtons, function (n) {
+      var t = textOf(n);
+      var score = 0;
+      if (has(t, "open sidebar")) score += 7;
+      if (has(t, "show sidebar")) score += 7;
+      if (has(t, "toggle sidebar")) score += 4;
+      return score;
+    });
+    if (sidebarChoice.node && sidebarChoice.score > 0 && tryClick(sidebarChoice.node)) {
+      return JSON.stringify({ ok: true, final: false, via: "opened_sidebar", debug: debug });
+    }
+
+    // 6) Open a likely actions menu globally.
+    var menuNodes = document.querySelectorAll("button,[role='button'],[data-testid],a");
+    debug.globalMenuCount = menuNodes.length;
+    var menuChoice = pickBest(menuNodes, function (n) { return scoreMenu(n, convId); });
+    if (menuChoice.node && menuChoice.score > 0 && tryClick(menuChoice.node)) {
+      return JSON.stringify({ ok: true, final: false, via: "opened_actions_menu", debug: debug });
+    }
+
+    return JSON.stringify({ ok: false, final: false, reason: "delete_controls_not_found", debug: debug });
   } catch (err) {
-    return {
+    return JSON.stringify({
       ok: false,
       final: false,
-      reason: 'js_exception',
+      reason: "js_exception",
       detail: String(err),
       debug: {
-        path: (window && window.location && window.location.pathname) ? window.location.pathname : '',
-      },
-    };
+        path: (window && window.location && window.location.pathname) ? window.location.pathname : ""
+      }
+    });
   }
 })();
 """
 
-    def _attempt_delete_current_chat(self, retries: int = 14, delay_ms: int = 500) -> None:
+    @staticmethod
+    def _decode_js_result_dict(result) -> dict:
+        if isinstance(result, dict):
+            return result
+        if isinstance(result, str):
+            text = result.strip()
+            if not text:
+                return {
+                    "ok": False,
+                    "final": False,
+                    "reason": "empty_js_result",
+                    "_raw_kind": "str",
+                    "_raw_preview": "",
+                }
+            try:
+                parsed = json.loads(text)
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "final": False,
+                    "reason": "non_json_js_result",
+                    "detail": str(exc),
+                    "_raw_kind": "str",
+                    "_raw_preview": text[:220],
+                }
+            if isinstance(parsed, dict):
+                return parsed
+            return {
+                "ok": False,
+                "final": False,
+                "reason": "non_dict_js_result",
+                "_raw_kind": "json",
+                "_raw_preview": repr(parsed)[:220],
+            }
+        if result is None:
+            return {
+                "ok": False,
+                "final": False,
+                "reason": "empty_js_result",
+                "_raw_kind": "none",
+                "_raw_preview": "None",
+            }
+        return {
+            "ok": False,
+            "final": False,
+            "reason": "unsupported_js_result_type",
+            "_raw_kind": type(result).__name__,
+            "_raw_preview": repr(result)[:220],
+        }
+
+    def _attempt_delete_current_chat(self, retries: int = 14, delay_ms: int = 500, done=None) -> None:
         page = self.browser.page()
         if page is None:
+            if done is not None:
+                done(False)
             return
 
         js = self._chatgpt_delete_chat_js()
 
         def _after(result) -> None:
-            ok = isinstance(result, dict) and bool(result.get("ok"))
-            final = isinstance(result, dict) and bool(result.get("final"))
-            via = str(result.get("via", "unknown")) if isinstance(result, dict) else "unknown"
-            reason = str(result.get("reason", "unknown")) if isinstance(result, dict) else "unknown"
-            debug = result.get("debug") if isinstance(result, dict) and isinstance(result.get("debug"), dict) else None
-            detail = str(result.get("detail", "")) if isinstance(result, dict) else ""
+            parsed = self._decode_js_result_dict(result)
+            ok = bool(parsed.get("ok"))
+            final = bool(parsed.get("final"))
+            via = str(parsed.get("via", "unknown"))
+            reason = str(parsed.get("reason", "unknown"))
+            debug = parsed.get("debug") if isinstance(parsed.get("debug"), dict) else None
+            detail = str(parsed.get("detail", ""))
+            raw_kind = str(parsed.get("_raw_kind", ""))
+            raw_preview = str(parsed.get("_raw_preview", ""))
 
-            if not isinstance(result, dict) and retries in (14, 10, 6, 2):
+            if raw_kind and retries in (22, 16, 10, 4, 1):
                 self._append_log(
                     "[INFO] Delete Chat raw JS result: "
-                    f"type={type(result).__name__}, value={result!r}"
+                    f"type={raw_kind}, value={raw_preview!r}"
                 )
 
             if ok and final:
@@ -1094,23 +1170,25 @@ class PhotoColorizerQt(QMainWindow):
                 else:
                     self._append_log(f"[INFO] Delete Chat succeeded ({via}).")
                 QTimer.singleShot(600, self._navigate_chatgpt)
+                if done is not None:
+                    done(True)
                 return
 
-            if debug and retries in (14, 10, 6, 2):
+            if debug and retries in (22, 16, 10, 4, 1):
                 self._append_log(
                     "[INFO] Delete Chat debug: "
                     f"path={debug.get('path','')}, convId={debug.get('convId','')}, "
                     f"dialogs={debug.get('dialogCount',0)}, deleteActions={debug.get('deleteActionCount',0)}, "
                     f"rowMenus={debug.get('rowMenuCount',0)}, globalMenus={debug.get('globalMenuCount',0)}, "
-                    f"api={debug.get('api',[])}"
+                    f"api={debug.get('apiStatuses','')}"
                 )
 
             if retries > 0:
-                if ok and retries in (10, 7, 4, 1):
+                if ok and retries in (18, 12, 6, 1):
                     self._append_log(f"[INFO] Delete Chat: progressing ({via})...")
-                elif (not ok) and retries in (10, 6, 2):
+                elif (not ok) and retries in (18, 12, 6, 1):
                     self._append_log("[INFO] Delete Chat: searching for delete controls...")
-                QTimer.singleShot(delay_ms, lambda: self._attempt_delete_current_chat(retries - 1, delay_ms))
+                QTimer.singleShot(delay_ms, lambda: self._attempt_delete_current_chat(retries - 1, delay_ms, done=done))
                 return
 
             if ok:
@@ -1118,6 +1196,8 @@ class PhotoColorizerQt(QMainWindow):
                     "[WARN] Delete Chat automation reached the final step but could not confirm completion. "
                     "Please finish deletion manually in ChatGPT."
                 )
+                if done is not None:
+                    done(False)
             else:
                 if reason == "current_chat_not_detected":
                     self._append_log(
@@ -1130,8 +1210,10 @@ class PhotoColorizerQt(QMainWindow):
                     f"[WARN] Delete Chat automation failed ({reason}). "
                     "Open the chat menu in ChatGPT and delete manually."
                 )
+                if done is not None:
+                    done(False)
 
-        page.runJavaScript(js, _after)
+        page.runJavaScript(js, 0, _after)
 
     def _on_browser_load_finished(self, ok: bool) -> None:
         if not ok:
@@ -1141,7 +1223,11 @@ class PhotoColorizerQt(QMainWindow):
             return
         # Try a few times because ChatGPT's composer appears after initial page load.
         self._auto_prefill_prompt(retries=5, delay_ms=700)
-        if self.pending_bw_upload_path is not None and self.pending_bw_upload_path.exists():
+        if (
+            self._full_workflow_active
+            and self.pending_bw_upload_path is not None
+            and self.pending_bw_upload_path.exists()
+        ):
             QTimer.singleShot(900, lambda: self._auto_upload_bw_to_chatgpt(self.pending_bw_upload_path, retries=5, delay_ms=800))
 
     def _on_auto_file_used_for_chatgpt(self, path_str: str) -> None:
@@ -1167,6 +1253,13 @@ class PhotoColorizerQt(QMainWindow):
         started = self._color_step_1(interactive=False)
         if not started:
             self._auto_get_c1_after_send = False
+            if self._full_workflow_active:
+                self._append_log("[WARN] Workflow aborted: Color Step 1 could not be started after upload.")
+                self._full_workflow_active = False
+                self._full_workflow_waiting_for_c1 = False
+                self._full_workflow_pending_delete = False
+                self._set_status("Ready")
+                self._refresh_workflow_status()
 
     def _stop_auto_get_c1_poll(self) -> None:
         self._auto_get_c1_polling = False
@@ -1195,9 +1288,11 @@ class PhotoColorizerQt(QMainWindow):
         if deadline is not None and time.monotonic() >= deadline:
             self._append_log(
                 "[WARN] Auto Get C1 timed out waiting for a downloadable ChatGPT image. "
-                "Use Get C1 manually when the result appears."
+                "Click ChatGPT's Download button manually; this app will still auto-import the next completed image."
             )
             self._stop_auto_get_c1_poll()
+            if self._full_workflow_active and self._full_workflow_waiting_for_c1:
+                self._set_status("Waiting for manual ChatGPT download...")
             return
 
         self._auto_get_c1_poll_attempt += 1
@@ -1329,11 +1424,15 @@ class PhotoColorizerQt(QMainWindow):
   };
 
   const selectors = [
+    'button[data-testid="send-button"]',
+    'button[data-testid*="submit" i]',
     'button[data-testid*="composer-send" i]',
     'button[data-testid*="send-button" i]',
     'button[data-testid*="send" i]',
     'button[aria-label*="send" i]',
+    'button[aria-label*="submit" i]',
     'button[title*="send" i]',
+    'button[title*="submit" i]',
     'button[type="submit"]',
     '[role="button"][aria-label*="send" i]'
   ];
@@ -1571,6 +1670,31 @@ class PhotoColorizerQt(QMainWindow):
                 return probe
             i += 1
 
+    def _move_c1_download_to_color_step1_dir(self, source_path: Path) -> Path:
+        if not source_path.exists() or not source_path.is_file():
+            return source_path
+        target_dir = self.color_step1_dir
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self._append_log(f"[WARN] Get C1: could not create color_step_1 folder: {exc}")
+            return source_path
+        target_name = self._sanitize_download_filename(source_path.name)
+        target_path = self._unique_download_path(target_dir, target_name)
+        try:
+            same_path = source_path.resolve() == target_path.resolve()
+        except Exception:
+            same_path = str(source_path) == str(target_path)
+        if same_path:
+            return source_path
+        try:
+            moved = Path(shutil.move(str(source_path), str(target_path)))
+            self._append_log(f"[INFO] Get C1: moved download to {moved}")
+            return moved
+        except Exception as exc:
+            self._append_log(f"[WARN] Get C1: move to {target_dir} failed ({exc}); using original file.")
+            return source_path
+
     @staticmethod
     def _download_state_name(item) -> str:
         try:
@@ -1590,7 +1714,8 @@ class PhotoColorizerQt(QMainWindow):
                 if self._auto_import_next_download:
                     pending = self._pending_auto_import_download_path
                     if pending is None or pending == target_path:
-                        self._import_download_path(target_path, source_label="Get C1")
+                        import_path = self._move_c1_download_to_color_step1_dir(target_path)
+                        self._import_download_path(import_path, source_label="Get C1")
                         self._auto_import_next_download = False
                         self._pending_auto_import_download_path = None
             else:
@@ -1615,6 +1740,8 @@ class PhotoColorizerQt(QMainWindow):
   const selectors = [
     'textarea[data-testid="prompt-textarea"]',
     'textarea#prompt-textarea',
+    'div#prompt-textarea[contenteditable]',
+    '[contenteditable][id="prompt-textarea"]',
     'textarea[aria-label*="Message"]',
     'textarea[placeholder*="Message"]',
     'textarea',
@@ -1670,13 +1797,12 @@ class PhotoColorizerQt(QMainWindow):
             self.browser.setFocus(Qt.OtherFocusReason)
             QTest.keyClick(target, Qt.Key_V, Qt.ControlModifier)
 
-            ok = isinstance(result, dict) and bool(result.get("ok"))
+            parsed = self._decode_js_result_dict(result)
+            ok = bool(parsed.get("ok"))
             if ok:
                 self._append_log("[INFO] Sent Ctrl+V to ChatGPT composer with selected B&W image on clipboard.")
             else:
-                reason = "unknown"
-                if isinstance(result, dict):
-                    reason = str(result.get("reason", "unknown"))
+                reason = str(parsed.get("reason", "unknown"))
                 self._append_log(
                     "[WARN] Could not focus ChatGPT composer automatically "
                     f"({reason}); Ctrl+V was still sent to the browser."
@@ -1716,13 +1842,12 @@ class PhotoColorizerQt(QMainWindow):
             target.setFocus(Qt.OtherFocusReason)
             self.browser.setFocus(Qt.OtherFocusReason)
             QTest.keyClick(target, Qt.Key_Return, Qt.NoModifier)
-            ok = isinstance(result, dict) and bool(result.get("ok"))
+            parsed = self._decode_js_result_dict(result)
+            ok = bool(parsed.get("ok"))
             if ok:
                 self._append_log("[INFO] Send fallback: pressed Enter in ChatGPT composer.")
             else:
-                reason = "unknown"
-                if isinstance(result, dict):
-                    reason = str(result.get("reason", "unknown"))
+                reason = str(parsed.get("reason", "unknown"))
                 self._append_log(
                     "[WARN] Send fallback used Enter without confirmed composer focus "
                     f"({reason})."
@@ -1751,13 +1876,12 @@ class PhotoColorizerQt(QMainWindow):
             self.browser.setFocus(Qt.OtherFocusReason)
             QTest.keyClick(target, Qt.Key_V, Qt.ControlModifier)
 
-            ok = isinstance(result, dict) and bool(result.get("ok"))
+            parsed = self._decode_js_result_dict(result)
+            ok = bool(parsed.get("ok"))
             if ok:
                 self._append_log("[INFO] Prompt fallback: pasted clipboard text into ChatGPT composer.")
             else:
-                reason = "unknown"
-                if isinstance(result, dict):
-                    reason = str(result.get("reason", "unknown"))
+                reason = str(parsed.get("reason", "unknown"))
                 self._append_log(
                     "[WARN] Prompt fallback paste used without confirmed composer focus "
                     f"({reason})."
@@ -1773,7 +1897,7 @@ class PhotoColorizerQt(QMainWindow):
         self,
         prompt: str,
         *,
-        retries: int = 7,
+        retries: int = 12,
         delay_ms: int = 550,
     ) -> None:
         def _attempt(remaining: int) -> None:
@@ -1790,7 +1914,7 @@ class PhotoColorizerQt(QMainWindow):
                 return
 
             if remaining > 0:
-                if remaining in (7, 4, 1):
+                if remaining in (12, 8, 4, 1):
                     self._append_log("[INFO] Waiting for ChatGPT composer to become ready...")
                 page = self.browser.page()
                 if page is None:
@@ -1804,7 +1928,7 @@ class PhotoColorizerQt(QMainWindow):
             self._append_log(
                 "[WARN] Prompt fill retries exhausted; using clipboard paste fallback before send."
             )
-            self._paste_prompt_clipboard_then_send(prompt, send_retries=14, send_delay_ms=700)
+            self._paste_prompt_clipboard_then_send(prompt, send_retries=18, send_delay_ms=700)
 
         _attempt(max(0, int(retries)))
 
@@ -1815,22 +1939,37 @@ class PhotoColorizerQt(QMainWindow):
         js = self._chatgpt_send_js()
 
         def _after_send(result) -> None:
-            ok = isinstance(result, dict) and bool(result.get("ok"))
+            parsed = self._decode_js_result_dict(result)
+            ok = bool(parsed.get("ok"))
             if ok:
-                via = str(result.get("via", "unknown"))
+                via = str(parsed.get("via", "unknown"))
                 self._append_log(f"[INFO] Color Step 1 sent to ChatGPT ({via}).")
                 if self._auto_get_c1_after_send:
                     self._auto_get_c1_after_send = False
                     self._start_auto_get_c1_poll(timeout_sec=1800, interval_ms=7000)
                 return
 
-            reason = "unknown"
-            if isinstance(result, dict):
-                reason = str(result.get("reason", "unknown"))
-
-            if reason == "send_disabled" and retries > 0:
+            reason = str(parsed.get("reason", "unknown"))
+            retriable_reasons = {
+                "send_disabled",
+                "send_button_not_found",
+                "composer_not_found",
+                "empty_js_result",
+                "non_json_js_result",
+                "non_dict_js_result",
+                "unsupported_js_result_type",
+            }
+            if retries > 0 and reason in retriable_reasons:
                 if retries in (10, 7, 4, 1):
-                    self._append_log("[INFO] Waiting for ChatGPT send control to become ready...")
+                    self._append_log(
+                        f"[INFO] Waiting for ChatGPT send control to become ready ({reason})..."
+                    )
+                QTimer.singleShot(delay_ms, lambda: self._attempt_chatgpt_send(retries - 1, delay_ms))
+                return
+
+            if retries > 0:
+                if retries in (10, 7, 4, 1):
+                    self._append_log(f"[INFO] Retrying ChatGPT send ({reason})...")
                 QTimer.singleShot(delay_ms, lambda: self._attempt_chatgpt_send(retries - 1, delay_ms))
                 return
 
@@ -1838,9 +1977,12 @@ class PhotoColorizerQt(QMainWindow):
             self._chatgpt_send_enter_fallback()
             if self._auto_get_c1_after_send:
                 self._auto_get_c1_after_send = False
+                self._append_log(
+                    "[INFO] Starting Auto Get C1 after Enter fallback (send confirmation unavailable)."
+                )
                 self._start_auto_get_c1_poll(timeout_sec=1800, interval_ms=7000)
 
-        page.runJavaScript(js, _after_send)
+        page.runJavaScript(js, 0, _after_send)
 
     def _color_step_1(self, *, interactive: bool = True) -> bool:
         if interactive:
@@ -1866,7 +2008,7 @@ class PhotoColorizerQt(QMainWindow):
             return False
 
         self._append_log("[INFO] Color Step 1: filling prompt and sending to ChatGPT.")
-        self._attempt_prompt_fill_then_send(prompt, retries=7, delay_ms=550)
+        self._attempt_prompt_fill_then_send(prompt, retries=12, delay_ms=550)
         return True
 
     def _download_and_import_c1(self, *, interactive: bool = True, quiet: bool = False) -> bool:
@@ -1990,14 +2132,12 @@ class PhotoColorizerQt(QMainWindow):
             self.pending_bw_upload_path = Path(selected)
             self._stop_auto_get_c1_poll()
             self._auto_get_c1_after_send = False
-            self._auto_color_step1_after_attach = True
+            self._auto_color_step1_after_attach = False
             self._auto_color_step1_scheduled = False
-            self._set_attach_status("photo selected (auto-attaching to ChatGPT)", ok=None)
+            self._set_attach_status("photo selected (not uploaded yet)", ok=None)
             self._append_log(
-                "[INFO] B&W selected. Auto-attaching, auto-running Color Step 1, "
-                "and auto-running Get C1 when ready."
+                "[INFO] B&W selected. Click Colorize to upload to ChatGPT and run full workflow."
             )
-            QTimer.singleShot(120, self._attach_selected_bw_to_chatgpt)
 
     def _pick_outdir(self) -> None:
         start = self.outdir_edit.text().strip() or str(self.repo_root / "outputs")
@@ -2124,6 +2264,16 @@ class PhotoColorizerQt(QMainWindow):
         self._append_log(f"[INFO] {source_label}: imported {image_path}")
         self._log_border_ratio_if_possible()
         self._refresh_workflow_status()
+        if self._full_workflow_active and self._full_workflow_waiting_for_c1:
+            self._full_workflow_waiting_for_c1 = False
+            if self._full_workflow_pending_delete:
+                self._append_log(
+                    "[INFO] Workflow: C1 imported. Deleting ChatGPT conversation before overlay run."
+                )
+                self._full_workflow_pending_delete = False
+                self._delete_current_chat_automated(done=self._on_full_workflow_delete_done)
+                return
+            self._on_full_workflow_delete_done(False)
 
     def _import_latest_download(self) -> None:
         downloads_dir = Path(self.downloads_edit.text().strip() or self._default_downloads_dir())
@@ -2162,6 +2312,67 @@ class PhotoColorizerQt(QMainWindow):
     # ------------------------------------------------------------------
     # Run pipeline
     # ------------------------------------------------------------------
+
+    def _start_full_workflow(self) -> None:
+        if self._full_workflow_active:
+            QMessageBox.warning(self, "Workflow in progress", "Colorize workflow is already in progress.")
+            return
+        if self.process is not None and self.process.state() != QProcess.NotRunning:
+            QMessageBox.warning(self, "Run in progress", "A run is already in progress.")
+            return
+        if not self.runner_script.exists():
+            QMessageBox.critical(self, "Missing runner", f"Could not find:\n{self.runner_script}")
+            return
+
+        bw_path = Path(self.bw_edit.text().strip())
+        if not bw_path.exists():
+            QMessageBox.warning(self, "Missing image", f"B&W original not found:\n{bw_path}")
+            return
+
+        prompt = self.prompt_box.toPlainText().strip() if hasattr(self, "prompt_box") else ""
+        if not prompt:
+            QMessageBox.warning(self, "Missing prompt", "Prompt is empty.")
+            return
+
+        current = self.browser.url().toString().lower() if hasattr(self, "browser") else ""
+        if "chatgpt.com" not in current:
+            QMessageBox.warning(self, "ChatGPT not open", "Open ChatGPT in the embedded browser first.")
+            return
+
+        self._stop_auto_get_c1_poll()
+        self._auto_get_c1_after_send = False
+        self._auto_color_step1_after_attach = True
+        self._auto_color_step1_scheduled = False
+        self._full_workflow_active = True
+        self._full_workflow_waiting_for_c1 = True
+        self._full_workflow_pending_delete = True
+        self._set_status("Running ChatGPT workflow...")
+        self.run_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        self._append_log("")
+        self._append_log(
+            "[INFO] Colorize workflow started: upload photo -> send prompt -> auto Get C1 -> delete chat -> overlay run."
+        )
+        self._set_attach_status("workflow running: uploading to ChatGPT", ok=None)
+        self.pending_bw_upload_path = bw_path
+        self._attach_selected_bw_to_chatgpt()
+
+    def _on_full_workflow_delete_done(self, success: bool) -> None:
+        if not self._full_workflow_active:
+            return
+        if success:
+            self._append_log("[INFO] Workflow: ChatGPT conversation deleted.")
+        else:
+            self._append_log("[WARN] Workflow: delete chat was not confirmed. Continuing to overlay run.")
+
+        self._full_workflow_active = False
+        self._full_workflow_waiting_for_c1 = False
+        self._full_workflow_pending_delete = False
+        self._append_log("[INFO] Workflow: launching overlay process.")
+        self._start_run()
+        if self.process is None or self.process.state() == QProcess.NotRunning:
+            self._set_status("Ready")
+            self._refresh_workflow_status()
 
     def _start_run(self) -> None:
         if self.process is not None and self.process.state() != QProcess.NotRunning:
