@@ -212,6 +212,67 @@ def parse_args() -> argparse.Namespace:
             "'identity', auto-switch regularization fallback to 'reference'."
         ),
     )
+    parser.add_argument(
+        "--accuracy-mode",
+        action="store_true",
+        help=(
+            "Enable slower, higher-accuracy overlay mode: forces setting='precise', "
+            "enables multi-pass pre-alignment selection, and increases pre-align effort."
+        ),
+    )
+    parser.add_argument(
+        "--multi-pass-global-align",
+        action="store_true",
+        help=(
+            "When a pre-aligned second match is available, compare overlap quality and "
+            "keep the better pass instead of always using the pre-aligned one."
+        ),
+    )
+    parser.add_argument(
+        "--prealign-ransac-iters",
+        type=int,
+        default=450,
+        help="RANSAC iterations for global similarity pre-alignment estimation.",
+    )
+    parser.add_argument(
+        "--prealign-min-samples",
+        type=int,
+        default=1200,
+        help="Minimum sampled correspondences used for pre-alignment estimation.",
+    )
+    parser.add_argument(
+        "--prealign-sample-cap",
+        type=int,
+        default=5000,
+        help="Maximum sampled correspondences used for pre-alignment estimation.",
+    )
+    parser.add_argument(
+        "--prealign-confidence-quantile",
+        type=float,
+        default=0.60,
+        help=(
+            "Keep correspondences with confidence >= this quantile before pre-alignment "
+            "estimation (0 disables confidence quantile filtering)."
+        ),
+    )
+    parser.add_argument(
+        "--prealign-border-trim-frac",
+        type=float,
+        default=0.0,
+        help=(
+            "Outpaint-aware pre-align filter: trim this fraction from each border in "
+            "both src/ref correspondence distributions before RANSAC."
+        ),
+    )
+    parser.add_argument(
+        "--prealign-overlap-margin",
+        type=float,
+        default=0.002,
+        help=(
+            "Minimum overlap-mean improvement required for selecting the pre-aligned pass "
+            "when multi-pass selection is enabled."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -787,6 +848,44 @@ def _warp_src_with_similarity_to_ref(
     return Image.fromarray(out_rgb)
 
 
+def _pred_overlap_mean(preds: dict[str, object]) -> float | None:
+    overlap_ab = preds.get("overlap_AB")
+    if not isinstance(overlap_ab, torch.Tensor):
+        return None
+    if overlap_ab.numel() == 0:
+        return None
+    try:
+        return float(overlap_ab[..., 0].mean().item())
+    except Exception:
+        return None
+
+
+def _trim_correspondences_for_prealign(
+    *,
+    src_pts: np.ndarray,
+    ref_pts: np.ndarray,
+    trim_frac: float,
+    min_points: int = 80,
+) -> tuple[np.ndarray, np.ndarray, bool]:
+    if src_pts.shape[0] != ref_pts.shape[0]:
+        return src_pts, ref_pts, False
+    n = int(src_pts.shape[0])
+    if trim_frac <= 0.0 or trim_frac >= 0.49 or n < max(2 * min_points, 16):
+        return src_pts, ref_pts, False
+
+    keep = np.ones((n,), dtype=bool)
+    for pts in (src_pts, ref_pts):
+        x = pts[:, 0]
+        y = pts[:, 1]
+        lo_x, hi_x = np.quantile(x, [trim_frac, 1.0 - trim_frac])
+        lo_y, hi_y = np.quantile(y, [trim_frac, 1.0 - trim_frac])
+        keep &= (x >= lo_x) & (x <= hi_x) & (y >= lo_y) & (y <= hi_y)
+
+    if int(keep.sum()) >= min_points:
+        return src_pts[keep], ref_pts[keep], True
+    return src_pts, ref_pts, False
+
+
 def main() -> int:
     args = parse_args()
     run_start = perf_counter()
@@ -841,6 +940,62 @@ def main() -> int:
     if not (0.0 <= float(args.auto_reference_fallback_overlap) <= 1.0):
         print("[ERROR] --auto-reference-fallback-overlap must be in [0, 1].", file=sys.stderr)
         return 1
+    if args.prealign_ransac_iters <= 0:
+        print("[ERROR] --prealign-ransac-iters must be > 0.", file=sys.stderr)
+        return 1
+    if args.prealign_min_samples <= 0:
+        print("[ERROR] --prealign-min-samples must be > 0.", file=sys.stderr)
+        return 1
+    if args.prealign_sample_cap <= 0:
+        print("[ERROR] --prealign-sample-cap must be > 0.", file=sys.stderr)
+        return 1
+    if args.prealign_min_samples > args.prealign_sample_cap:
+        print("[ERROR] --prealign-min-samples cannot exceed --prealign-sample-cap.", file=sys.stderr)
+        return 1
+    if not (0.0 <= float(args.prealign_confidence_quantile) < 1.0):
+        print("[ERROR] --prealign-confidence-quantile must be in [0, 1).", file=sys.stderr)
+        return 1
+    if not (0.0 <= float(args.prealign_border_trim_frac) <= 0.45):
+        print("[ERROR] --prealign-border-trim-frac must be in [0, 0.45].", file=sys.stderr)
+        return 1
+    if float(args.prealign_overlap_margin) < 0.0:
+        print("[ERROR] --prealign-overlap-margin must be >= 0.", file=sys.stderr)
+        return 1
+
+    effective_setting = str(args.setting)
+    effective_global_prealign_enabled = not bool(args.disable_global_prealign)
+    effective_multi_pass_global_align = bool(args.multi_pass_global_align)
+    effective_prealign_ransac_iters = int(args.prealign_ransac_iters)
+    effective_prealign_min_samples = int(args.prealign_min_samples)
+    effective_prealign_sample_cap = int(args.prealign_sample_cap)
+    effective_prealign_conf_quantile = float(args.prealign_confidence_quantile)
+    effective_prealign_border_trim_frac = float(args.prealign_border_trim_frac)
+    effective_prealign_overlap_margin = float(args.prealign_overlap_margin)
+
+    if args.accuracy_mode:
+        if effective_setting != "precise":
+            print(
+                f"[INFO] Accuracy mode enabled: overriding setting '{effective_setting}' -> 'precise'."
+            )
+        effective_setting = "precise"
+        if not effective_global_prealign_enabled:
+            print("[INFO] Accuracy mode enabled: re-enabling global pre-alignment.")
+        effective_global_prealign_enabled = True
+        effective_multi_pass_global_align = True
+        effective_prealign_ransac_iters = max(effective_prealign_ransac_iters, 1400)
+        effective_prealign_min_samples = max(effective_prealign_min_samples, 3000)
+        effective_prealign_sample_cap = max(effective_prealign_sample_cap, 10000)
+        effective_prealign_conf_quantile = max(effective_prealign_conf_quantile, 0.65)
+        effective_prealign_border_trim_frac = max(effective_prealign_border_trim_frac, 0.08)
+        effective_prealign_overlap_margin = max(effective_prealign_overlap_margin, 0.002)
+        print(
+            "[INFO] Accuracy mode parameters: "
+            f"multi-pass={effective_multi_pass_global_align}, "
+            f"ransac_iters={effective_prealign_ransac_iters}, "
+            f"samples={effective_prealign_min_samples}-{effective_prealign_sample_cap}, "
+            f"conf_q={effective_prealign_conf_quantile:.2f}, "
+            f"border_trim={effective_prealign_border_trim_frac:.2f}."
+        )
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] Output directory: {args.outdir.resolve()}")
@@ -858,13 +1013,25 @@ def main() -> int:
         "src_crop_applied": False,
         "ref_crop_margins_lrtb": [0, 0, 0, 0],
         "src_crop_margins_lrtb": [0, 0, 0, 0],
-        "global_prealign_enabled": not bool(args.disable_global_prealign),
+        "global_prealign_enabled": bool(effective_global_prealign_enabled),
         "global_prealign_applied": False,
+        "global_prealign_candidate_applied": False,
+        "global_prealign_selected": False,
         "global_prealign_scale": None,
         "global_prealign_rotation_deg": None,
         "global_prealign_inlier_ratio": None,
         "global_prealign_median_err_px": None,
         "global_prealign_artifact": None,
+        "global_prealign_overlap_base": None,
+        "global_prealign_overlap_prealigned": None,
+        "global_prealign_overlap_delta": None,
+        "global_prealign_samples_used": 0,
+        "global_prealign_conf_quantile": float(effective_prealign_conf_quantile),
+        "global_prealign_border_trim_frac": float(effective_prealign_border_trim_frac),
+        "global_prealign_border_trim_applied": False,
+        "global_prealign_ransac_iters": int(effective_prealign_ransac_iters),
+        "global_prealign_multi_pass_enabled": bool(effective_multi_pass_global_align),
+        "global_prealign_overlap_margin": float(effective_prealign_overlap_margin),
     }
 
     if not args.disable_auto_border_crop:
@@ -946,14 +1113,18 @@ def main() -> int:
             )
 
     stage_start = perf_counter()
-    print(f"[INFO] Initializing RoMa v2 (setting={args.setting}, compile={args.compile}) ...")
-    model = RoMaV2(RoMaV2.Cfg(setting=args.setting, compile=args.compile))
+    print(
+        f"[INFO] Initializing RoMa v2 (setting={effective_setting}, compile={args.compile}) ..."
+    )
+    model = RoMaV2(RoMaV2.Cfg(setting=effective_setting, compile=args.compile))
     print(f"[TIMING] Model init: {perf_counter() - stage_start:.2f}s")
 
     # Capture model config before it's potentially freed for VRAM
     model_info = {
-        "setting": args.setting,
+        "setting": effective_setting,
+        "setting_requested": str(args.setting),
         "compile": bool(args.compile),
+        "accuracy_mode": bool(args.accuracy_mode),
         "H_lr": int(model.H_lr),
         "W_lr": int(model.W_lr),
         "H_hr": int(model.H_hr) if model.H_hr is not None else None,
@@ -985,32 +1156,65 @@ def main() -> int:
     overlap_median: float | None = None
     effective_regularize_fallback = str(args.regularize_fallback)
     auto_reference_fallback_applied = False
-    if not args.disable_global_prealign:
+    if effective_global_prealign_enabled:
         prealign_stage_start = perf_counter()
         print("[INFO] Estimating global pre-alignment (scale/rotation/translation) ...")
+        base_preds = preds
+        base_src_img = src_img
+        base_src_w, base_src_h = src_w, src_h
+        base_src_match_path = src_match_path
+        base_overlap_mean = _pred_overlap_mean(base_preds)
+        preprocessing["global_prealign_overlap_base"] = (
+            float(base_overlap_mean) if base_overlap_mean is not None else None
+        )
         try:
-            prealign_samples = min(max(1200, int(args.num_samples)), 5000)
-            matches0, sampled_overlaps0, _pa, _pb = model.sample(preds, prealign_samples)
+            prealign_samples = min(
+                max(int(effective_prealign_min_samples), int(args.num_samples)),
+                int(effective_prealign_sample_cap),
+            )
+            matches0, sampled_overlaps0, _pa, _pb = model.sample(base_preds, prealign_samples)
             kpts_ref0, kpts_src0 = model.to_pixel_coordinates(matches0, ref_h, ref_w, src_h, src_w)
             src_pts = kpts_src0.detach().cpu().numpy()
             ref_pts = kpts_ref0.detach().cpu().numpy()
             conf = sampled_overlaps0.detach().cpu().numpy().reshape(-1)
 
-            if conf.size > 0:
-                q = float(np.quantile(conf, 0.60))
+            if conf.size > 0 and effective_prealign_conf_quantile > 0.0:
+                q = float(np.quantile(conf, float(effective_prealign_conf_quantile)))
                 keep = conf >= q
                 if int(np.sum(keep)) >= 60:
                     src_pts = src_pts[keep]
                     ref_pts = ref_pts[keep]
 
-            diag = float(math.hypot(ref_w, ref_h))
-            inlier_thresh = max(4.0, 0.006 * diag)
-            src_to_ref_m, inlier_ratio, median_err = _estimate_similarity_ransac(
-                src_pts.astype(np.float32, copy=False),
-                ref_pts.astype(np.float32, copy=False),
-                iters=450,
-                inlier_thresh_px=inlier_thresh,
+            src_pts, ref_pts, trim_applied = _trim_correspondences_for_prealign(
+                src_pts=src_pts,
+                ref_pts=ref_pts,
+                trim_frac=float(effective_prealign_border_trim_frac),
+                min_points=80,
             )
+            preprocessing["global_prealign_border_trim_applied"] = bool(trim_applied)
+            if trim_applied:
+                print(
+                    "[INFO] Outpaint-aware border trim applied for pre-align "
+                    f"(trim_frac={float(effective_prealign_border_trim_frac):.3f}, "
+                    f"samples={int(src_pts.shape[0])})."
+                )
+            preprocessing["global_prealign_samples_used"] = int(src_pts.shape[0])
+
+            if int(src_pts.shape[0]) < 4:
+                print("[WARN] Not enough correspondences for stable global pre-align after filtering.")
+                src_to_ref_m = None
+                inlier_ratio = 0.0
+                median_err = float("inf")
+            else:
+                diag = float(math.hypot(ref_w, ref_h))
+                inlier_thresh = max(4.0, 0.006 * diag)
+                src_to_ref_m, inlier_ratio, median_err = _estimate_similarity_ransac(
+                    src_pts.astype(np.float32, copy=False),
+                    ref_pts.astype(np.float32, copy=False),
+                    iters=int(effective_prealign_ransac_iters),
+                    inlier_thresh_px=inlier_thresh,
+                )
+
             preprocessing["global_prealign_inlier_ratio"] = float(inlier_ratio)
             preprocessing["global_prealign_median_err_px"] = float(median_err)
 
@@ -1029,24 +1233,67 @@ def main() -> int:
 
                 if inlier_ratio >= float(args.min_global_inlier_ratio) and 0.30 <= scale <= 3.50:
                     prealigned = _warp_src_with_similarity_to_ref(
-                        src_img,
+                        base_src_img,
                         ref_w=ref_w,
                         ref_h=ref_h,
                         src_to_ref=src_to_ref_m,
                     )
                     if prealigned is not None:
-                        src_img = prealigned
-                        src_w, src_h = src_img.size
-                        src_match_path = args.outdir / "src_global_prealigned.png"
-                        src_img.save(src_match_path)
-                        output_files.append(src_match_path)
-                        preprocessing["global_prealign_applied"] = True
-                        preprocessing["global_prealign_artifact"] = str(src_match_path.resolve())
+                        prealigned_path = args.outdir / "src_global_prealigned.png"
+                        prealigned.save(prealigned_path)
+                        output_files.append(prealigned_path)
+                        preprocessing["global_prealign_candidate_applied"] = True
+                        preprocessing["global_prealign_artifact"] = str(prealigned_path.resolve())
                         print("[INFO] Running dense match on globally pre-aligned source ...")
                         stage_match2 = perf_counter()
-                        preds = model.match(str(ref_match_path), str(src_match_path))
+                        preds_prealigned = model.match(str(ref_match_path), str(prealigned_path))
                         print("[INFO] Second match complete (after global pre-align).")
                         print(f"[TIMING] Dense match (pre-aligned): {perf_counter() - stage_match2:.2f}s")
+                        prealigned_overlap_mean = _pred_overlap_mean(preds_prealigned)
+                        preprocessing["global_prealign_overlap_prealigned"] = (
+                            float(prealigned_overlap_mean)
+                            if prealigned_overlap_mean is not None
+                            else None
+                        )
+
+                        select_prealigned = True
+                        if effective_multi_pass_global_align:
+                            if base_overlap_mean is not None and prealigned_overlap_mean is not None:
+                                delta = float(prealigned_overlap_mean - base_overlap_mean)
+                                preprocessing["global_prealign_overlap_delta"] = delta
+                                if delta >= float(effective_prealign_overlap_margin):
+                                    select_prealigned = True
+                                    print(
+                                        "[INFO] Multi-pass selection: using pre-aligned pass "
+                                        f"(overlap delta={delta:+.4f} >= {float(effective_prealign_overlap_margin):.4f})."
+                                    )
+                                else:
+                                    select_prealigned = False
+                                    print(
+                                        "[INFO] Multi-pass selection: keeping baseline pass "
+                                        f"(overlap delta={delta:+.4f} < {float(effective_prealign_overlap_margin):.4f})."
+                                    )
+                            elif base_overlap_mean is not None and prealigned_overlap_mean is None:
+                                select_prealigned = False
+                                print(
+                                    "[INFO] Multi-pass selection: keeping baseline pass "
+                                    "(pre-aligned overlap unavailable)."
+                                )
+
+                        if select_prealigned:
+                            preds = preds_prealigned
+                            src_img = prealigned
+                            src_w, src_h = src_img.size
+                            src_match_path = prealigned_path
+                            preprocessing["global_prealign_applied"] = True
+                            preprocessing["global_prealign_selected"] = True
+                        else:
+                            preds = base_preds
+                            src_img = base_src_img
+                            src_w, src_h = base_src_w, base_src_h
+                            src_match_path = base_src_match_path
+                            preprocessing["global_prealign_applied"] = False
+                            preprocessing["global_prealign_selected"] = False
                     else:
                         print("[WARN] Global pre-align transform could not be applied. Continuing without it.")
                 else:
@@ -1553,6 +1800,14 @@ def main() -> int:
             "diag_max_side": int(args.diag_max_side),
             "filter_max_megapixels": float(args.filter_max_megapixels),
             "save_dense_preds": bool(args.save_dense_preds),
+            "accuracy_mode": bool(args.accuracy_mode),
+            "multi_pass_global_align": bool(effective_multi_pass_global_align),
+            "prealign_ransac_iters": int(effective_prealign_ransac_iters),
+            "prealign_min_samples": int(effective_prealign_min_samples),
+            "prealign_sample_cap": int(effective_prealign_sample_cap),
+            "prealign_confidence_quantile": float(effective_prealign_conf_quantile),
+            "prealign_border_trim_frac": float(effective_prealign_border_trim_frac),
+            "prealign_overlap_margin": float(effective_prealign_overlap_margin),
         },
         "metrics": {
             "computed_on": [int(diag_w), int(diag_h)],
@@ -1605,6 +1860,8 @@ def main() -> int:
             f"(orig {src_orig_w}x{src_orig_h}, match {src_w}x{src_h})"
         ),
         f"setting: {summary['model']['setting']}",
+        f"setting_requested: {summary['model']['setting_requested']}",
+        f"accuracy_mode: {bool(summary['model']['accuracy_mode'])}",
         f"compile: {summary['model']['compile']}",
         f"warp_map_hw: {h_map}x{w_map}",
         f"num_samples_requested: {args.num_samples}",
@@ -1634,6 +1891,13 @@ def main() -> int:
         f"diag_max_side: {int(args.diag_max_side)}",
         f"filter_max_megapixels: {float(args.filter_max_megapixels):.2f}",
         f"save_dense_preds: {bool(args.save_dense_preds)}",
+        f"multi_pass_global_align: {bool(effective_multi_pass_global_align)}",
+        f"prealign_ransac_iters: {int(effective_prealign_ransac_iters)}",
+        f"prealign_min_samples: {int(effective_prealign_min_samples)}",
+        f"prealign_sample_cap: {int(effective_prealign_sample_cap)}",
+        f"prealign_confidence_quantile: {float(effective_prealign_conf_quantile):.3f}",
+        f"prealign_border_trim_frac: {float(effective_prealign_border_trim_frac):.3f}",
+        f"prealign_overlap_margin: {float(effective_prealign_overlap_margin):.4f}",
         f"metrics_computed_on: {diag_w}x{diag_h}",
         f"mae_before_src_resized_vs_ref: {mae_before:.6f}",
         f"mae_after_warped_vs_ref: {mae_warped:.6f}",
@@ -1671,10 +1935,17 @@ def main() -> int:
             "preprocessing_global_prealign: "
             f"enabled={bool(preprocessing['global_prealign_enabled'])}, "
             f"applied={bool(preprocessing['global_prealign_applied'])}, "
+            f"candidate_applied={bool(preprocessing['global_prealign_candidate_applied'])}, "
+            f"selected={bool(preprocessing['global_prealign_selected'])}, "
             f"scale={preprocessing['global_prealign_scale']}, "
             f"rot_deg={preprocessing['global_prealign_rotation_deg']}, "
             f"inlier_ratio={preprocessing['global_prealign_inlier_ratio']}, "
-            f"median_err_px={preprocessing['global_prealign_median_err_px']}"
+            f"median_err_px={preprocessing['global_prealign_median_err_px']}, "
+            f"overlap_base={preprocessing['global_prealign_overlap_base']}, "
+            f"overlap_prealigned={preprocessing['global_prealign_overlap_prealigned']}, "
+            f"overlap_delta={preprocessing['global_prealign_overlap_delta']}, "
+            f"samples_used={preprocessing['global_prealign_samples_used']}, "
+            f"border_trim_applied={bool(preprocessing['global_prealign_border_trim_applied'])}"
         ),
         "",
         "pred fields:",

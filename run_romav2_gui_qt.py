@@ -66,48 +66,30 @@ PREVIEW_FILES = [
 ]
 
 
-DEFAULT_PREP_PROMPT = """Restore this old photograph in one continuous workflow and produce a single final image.
+DEFAULT_PREP_PROMPT = """Restore this old photograph in one continuous edit and produce a single final image.
 
 Follow these steps in this exact order:
-
-1. Detect whether the photo includes a visible physical frame, mount, border card, CDV card edge, daguerreotype case edge, decorative mat, or any non-image surround.
-2. If a frame or mount is present, crop/trim it away first so that only the actual photographic image area remains. Do not preserve, duplicate, or expand the frame, card, mount, or surround.
-3. Neutralize the aged sepia/brown/yellow cast before colorization. Do not leave the final image with an overall brown antique tint unless a specific object is truly brown.
-4. Restore and enhance the photograph carefully:
+1. Detect whether the photo includes any visible frame, mount, border card, decorative mat, case edge, or non-image surround.
+2. If present, crop/trim away the surround so only the original photographic image area remains.
+3. Neutralize the aged sepia, yellow, or brown cast before colorization. Do not leave an overall antique tint unless an object is truly that color.
+4. Restore the photo carefully:
    - improve sharpness and fine detail
    - recover facial features, hair, clothing texture, and background detail
    - reduce blur, haze, dust, scratches, stains, cracks, and age damage
-   - preserve realism and original identity
+   - preserve the original person’s identity and bone structure
    - do not over-smooth skin
-   - do not invent modern-looking features
-5. Colorize the image in a vivid but historically plausible way:
-   - use full natural color, not partial sepia tinting
-   - produce a genuinely colorful result where the scene calls for it
-   - use realistic skin tones and believable fabric, object, and background colors
-   - allow distinct greens, blues, reds, sky tones, wood tones, and textile colors when historically appropriate
-   - keep saturation realistic, but do not leave the image mostly beige, tan, or brown
-6. Expand the image content itself equally in ALL FOUR DIRECTIONS with no exceptions:
-   - expand left, right, top, and bottom evenly
-   - add 25% of the original cropped image width to the LEFT
-   - add 25% of the original cropped image width to the RIGHT
-   - add 25% of the original cropped image height to the TOP
-   - add 25% of the original cropped image height to the BOTTOM
-   - this means the final canvas must be 150% of the original cropped width and 150% of the original cropped height
-   - do not place most of the expansion on only one or two sides
-   - do not skip any side
-   - do not crop after expansion
-   - do not add a frame, border, blank margin, or decorative edge
-   - extend the actual photographic scene naturally on all four sides
-7. Return one final image that already includes frame removal if needed, restoration, full historical colorization, and the four-sided 25% expansion.
-
-Critical requirements:
-- Complete all steps in one pass.
-- The border expansion must happen in this same final output.
-- The expansion must be symmetrical and applied to all four sides.
-- Do not expand only horizontally.
-- Do not expand only vertically.
-- Do not expand only where composition seems convenient.
-- Do not require a second prompt."""
+   - do not invent new features
+   - if there is a person, do not make the face look modern, plastic, or AI-generated
+   - if there are no people in the photo, don't add any that don't exist
+5. Colorize the image in vivid but historically plausible natural color:
+   - realistic skin tones
+   - natural hair color
+   - accurate clothing colors for the era
+   - realistic background colors
+   - avoid oversaturation
+6. Preserve the original pose, expression, framing, composition and photographic realism.
+7. Output only the final restored color image.
+    - do NOT crop in the image or shrink in the edges of the photograph"""
 
 class AutoUploadWebPage(QWebEnginePage):
     """QWebEnginePage that can auto-answer file dialogs with a pending file path."""
@@ -355,6 +337,11 @@ class PhotoColorizerQt(QMainWindow):
         self.setting_combo.currentTextChanged.connect(lambda _: self._on_setting_changed_for_prewarm())
         form.addRow("Quality preset", self.setting_combo)
 
+        self.accuracy_mode_check = QCheckBox("Accuracy mode (slower, best overlay alignment)")
+        self.accuracy_mode_check.setChecked(True)
+        self.accuracy_mode_check.stateChanged.connect(self._on_accuracy_mode_toggled)
+        form.addRow("", self.accuracy_mode_check)
+
         self.color_opacity_spin = QDoubleSpinBox()
         self.color_opacity_spin.setDecimals(2)
         self.color_opacity_spin.setRange(0.0, 1.0)
@@ -372,7 +359,10 @@ class PhotoColorizerQt(QMainWindow):
         outdir_widget.setLayout(outdir_row)
         form.addRow("Output folder", outdir_widget)
 
-        helper = QLabel("Use defaults unless you need precise tuning. Fine-grain controls are in Advanced.")
+        helper = QLabel(
+            "Accuracy mode is recommended for best overlay fit (slower). "
+            "Fine-grain controls are in Advanced."
+        )
         helper.setWordWrap(True)
         form.addRow("", helper)
 
@@ -386,6 +376,7 @@ class PhotoColorizerQt(QMainWindow):
         warm_widget = QWidget()
         warm_widget.setLayout(warm_row)
         form.addRow("", warm_widget)
+        self._on_accuracy_mode_toggled()
         return group
 
     def _build_advanced_group(self) -> QGroupBox:
@@ -620,8 +611,24 @@ class PhotoColorizerQt(QMainWindow):
         self._refresh_workflow_status()
         QTimer.singleShot(200, self._start_background_prewarm)
 
+    def _effective_roma_setting(self) -> str:
+        if hasattr(self, "accuracy_mode_check") and self.accuracy_mode_check.isChecked():
+            return "precise"
+        return self.setting_combo.currentText() if hasattr(self, "setting_combo") else "fast"
+
+    def _on_accuracy_mode_toggled(self, _state=None) -> None:
+        enabled = bool(self.accuracy_mode_check.isChecked()) if hasattr(self, "accuracy_mode_check") else False
+        if hasattr(self, "setting_combo"):
+            self.setting_combo.setEnabled(not enabled)
+            if enabled:
+                self.setting_combo.setToolTip("Accuracy mode forces RoMa setting 'precise'.")
+            else:
+                self.setting_combo.setToolTip("")
+        self._refresh_workflow_status()
+        QTimer.singleShot(200, self._start_background_prewarm)
+
     def _start_background_prewarm(self, force: bool = False) -> None:
-        setting = self.setting_combo.currentText() if hasattr(self, "setting_combo") else "fast"
+        setting = self._effective_roma_setting()
         if self.process is not None and self.process.state() != QProcess.NotRunning:
             return
         if self.prewarm_process is not None and self.prewarm_process.state() != QProcess.NotRunning:
@@ -670,6 +677,8 @@ class PhotoColorizerQt(QMainWindow):
             "4",
             "--warmup-only",
         ]
+        if hasattr(self, "accuracy_mode_check") and self.accuracy_mode_check.isChecked():
+            cmd.append("--accuracy-mode")
 
         proc = QProcess(self)
         proc.setWorkingDirectory(str(self.repo_root))
@@ -758,7 +767,7 @@ class PhotoColorizerQt(QMainWindow):
         color_path = Path(self.color_edit.text().strip()) if hasattr(self, "color_edit") else Path()
         bw_ok = bw_path.exists() and bw_path.is_file()
         color_ok = color_path.exists() and color_path.is_file()
-        setting = self.setting_combo.currentText() if hasattr(self, "setting_combo") else "fast"
+        setting = self._effective_roma_setting()
         prewarm_ready = self._is_setting_prewarmed(setting)
         prewarm_running = (
             self.prewarm_process is not None
@@ -2353,6 +2362,8 @@ class PhotoColorizerQt(QMainWindow):
         self._append_log(
             "[INFO] Colorize workflow started: upload photo -> send prompt -> auto Get C1 -> delete chat -> overlay run."
         )
+        if hasattr(self, "accuracy_mode_check") and self.accuracy_mode_check.isChecked():
+            self._append_log("[INFO] Accuracy mode is ON (precise + multi-pass pre-align).")
         self._set_attach_status("workflow running: uploading to ChatGPT", ok=None)
         self.pending_bw_upload_path = bw_path
         self._attach_selected_bw_to_chatgpt()
@@ -2417,7 +2428,7 @@ class PhotoColorizerQt(QMainWindow):
             "--outdir",
             str(outdir),
             "--setting",
-            self.setting_combo.currentText(),
+            self._effective_roma_setting(),
             "--num-samples",
             str(self.num_samples_spin.value()),
             "--max-draw",
@@ -2435,6 +2446,8 @@ class PhotoColorizerQt(QMainWindow):
             "--color-opacity",
             str(self.color_opacity_spin.value()),
         ]
+        if hasattr(self, "accuracy_mode_check") and self.accuracy_mode_check.isChecked():
+            cmd.append("--accuracy-mode")
         if self.compile_check.isChecked():
             cmd.append("--compile")
 
