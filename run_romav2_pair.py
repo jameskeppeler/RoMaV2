@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import subprocess
 import shutil
 import sys
 import traceback
@@ -111,12 +112,73 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--chroma-edge-preserve",
+        type=float,
+        default=0.85,
+        help=(
+            "Edge preservation blend for chroma smoothing in [0, 1]. "
+            "0 = fully smoothed chroma, 1 = keep more original donor chroma at image edges."
+        ),
+    )
+    parser.add_argument(
         "--color-opacity",
         type=float,
         default=1.0,
         help=(
             "Opacity for color transfer in [0, 1]. "
             "1.0 = full transferred color, 0.0 = keep base image unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--chroma-boost",
+        type=float,
+        default=1.0,
+        help=(
+            "Global chroma multiplier applied to donor color (LAB a/b channels) "
+            "before final blend. >1.0 increases saturation, <1.0 reduces it."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-chroma-match",
+        action="store_true",
+        help=(
+            "Scale donor chroma toward the C1 image chroma distribution (robust quantile match) "
+            "before applying --chroma-boost."
+        ),
+    )
+    parser.add_argument(
+        "--disable-bw-gray-balance",
+        action="store_true",
+        help=(
+            "Disable B&W base normalization before overlay. By default, the reference image is "
+            "neutralized to grayscale and tonally balanced before Photoshop-style color blend."
+        ),
+    )
+    parser.add_argument(
+        "--bw-black-point-clip",
+        type=float,
+        default=0.01,
+        help=(
+            "Lower-tail clip quantile for B&W tonal balance in [0, 0.20). "
+            "Example: 0.01 clips the darkest 1%% before level expansion."
+        ),
+    )
+    parser.add_argument(
+        "--bw-white-point-clip",
+        type=float,
+        default=0.01,
+        help=(
+            "Upper-tail clip quantile for B&W tonal balance in [0, 0.20). "
+            "Example: 0.01 clips the brightest 1%% before level expansion."
+        ),
+    )
+    parser.add_argument(
+        "--bw-midtone-target",
+        type=float,
+        default=0.55,
+        help=(
+            "Target median luminance after B&W balance in (0, 1). "
+            "Higher brightens mids, lower darkens mids."
         ),
     )
     parser.add_argument(
@@ -176,6 +238,15 @@ def parse_args() -> argparse.Namespace:
         help="Maximum fraction removable from each side during auto border crop.",
     )
     parser.add_argument(
+        "--border-exclude-mask",
+        action="store_true",
+        help=(
+            "Detect photo borders/frames on the reference (B&W) image and keep "
+            "those areas grayscale in the final colorized output. Useful for CDVs, "
+            "cabinet cards, or phone photos of framed prints."
+        ),
+    )
+    parser.add_argument(
         "--disable-global-prealign",
         action="store_true",
         help=(
@@ -216,8 +287,8 @@ def parse_args() -> argparse.Namespace:
         "--accuracy-mode",
         action="store_true",
         help=(
-            "Enable slower, higher-accuracy overlay mode: forces setting='precise', "
-            "enables multi-pass pre-alignment selection, and increases pre-align effort."
+            "Enable slower, higher-accuracy overlay mode: keeps selected model setting, "
+            "and enables stronger multi-pass pre-alignment + iterative re-match."
         ),
     )
     parser.add_argument(
@@ -273,7 +344,75 @@ def parse_args() -> argparse.Namespace:
             "when multi-pass selection is enabled."
         ),
     )
+    parser.add_argument(
+        "--iterative-rematch-passes",
+        type=int,
+        default=0,
+        help=(
+            "Additional dense re-match passes. Each pass warps source toward reference, "
+            "matches again, and composes the new warp for tighter geometry alignment."
+        ),
+    )
+    parser.add_argument(
+        "--iterative-rematch-overlap-margin",
+        type=float,
+        default=0.001,
+        help=(
+            "Minimum overlap-mean gain required to accept an iterative re-match pass."
+        ),
+    )
+    parser.add_argument(
+        "--iterative-rematch-mae-margin",
+        type=float,
+        default=0.0005,
+        help=(
+            "Minimum grayscale MAE reduction required to accept an iterative re-match pass."
+        ),
+    )
     return parser.parse_args()
+
+
+def _query_nvidia_gpu_snapshot() -> dict[str, float] | None:
+    """Best-effort NVIDIA GPU telemetry via nvidia-smi."""
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.total,memory.used,utilization.gpu,temperature.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2.5,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    line = (result.stdout or "").strip().splitlines()
+    if not line:
+        return None
+    parts = [p.strip() for p in line[0].split(",")]
+    if len(parts) < 4:
+        return None
+    try:
+        mem_total = float(parts[0])
+        mem_used = float(parts[1])
+        util = float(parts[2])
+        temp = float(parts[3])
+    except Exception:
+        return None
+    if mem_total <= 0:
+        return None
+    mem_ratio = mem_used / mem_total
+    return {
+        "memory_total_mib": mem_total,
+        "memory_used_mib": mem_used,
+        "memory_ratio": mem_ratio,
+        "utilization_percent": util,
+        "temperature_c": temp,
+    }
 
 
 def _box_filter_2d(src: np.ndarray, radius: int) -> np.ndarray:
@@ -448,20 +587,187 @@ def _set_lum_rgb01(rgb_01: np.ndarray, target_lum: np.ndarray) -> np.ndarray:
     return _clip_color_rgb01(shifted)
 
 
+def _detect_border_mask(rgb_uint8: np.ndarray, max_border_frac: float = 0.25) -> np.ndarray | None:
+    """Detect photo border/frame and return a float32 mask (1=photo, 0=border).
+
+    Returns None if no significant border is detected.
+    Uses a two-stage approach:
+      1. Sample very thin outer rim (0.5%) to identify border color
+      2. Grow inward from edges that match that color to find border extent
+    This works even when the photo bleeds to some edges (partial borders).
+    """
+    h, w = rgb_uint8.shape[:2]
+    if h < 128 or w < 128:
+        return None
+
+    luma = rgb_uint8.mean(axis=2).astype(np.float32) if rgb_uint8.ndim == 3 else rgb_uint8.astype(np.float32)
+    sat = (rgb_uint8.max(axis=2).astype(np.float32) - rgb_uint8.min(axis=2).astype(np.float32)) if rgb_uint8.ndim == 3 else np.zeros_like(luma)
+
+    # Stage 1: Sample very thin outer rim to identify border color.
+    # Use only the outermost 0.5% which is almost certainly border if one exists.
+    thin_y = max(3, int(round(h * 0.005)))
+    thin_x = max(3, int(round(w * 0.005)))
+
+    edge_strips = {
+        "top": luma[:thin_y, :],
+        "bottom": luma[-thin_y:, :],
+        "left": luma[:, :thin_x],
+        "right": luma[:, -thin_x:],
+    }
+    # Also check corners — these are the most reliable border samples.
+    # Keep corners the same size as the thin rim so we only sample actual border pixels.
+    corner_sz_y = max(4, int(h * 0.005))
+    corner_sz_x = max(4, int(w * 0.005))
+    corners = np.concatenate([
+        luma[:corner_sz_y, :corner_sz_x].ravel(),
+        luma[:corner_sz_y, -corner_sz_x:].ravel(),
+        luma[-corner_sz_y:, :corner_sz_x].ravel(),
+        luma[-corner_sz_y:, -corner_sz_x:].ravel(),
+    ])
+    corner_median = float(np.median(corners))
+    corner_std = float(np.std(corners))
+
+    # If corners are not uniform, no border
+    if corner_std > 50.0:
+        return None
+
+    # Check which edges match the corner color (border color)
+    border_luma_ref = corner_median
+    uniform_edges = {}
+    for side, strip in edge_strips.items():
+        strip_median = float(np.median(strip.ravel()))
+        # Edge matches border if its median is close to corner median
+        if abs(strip_median - border_luma_ref) < 40.0:
+            uniform_edges[side] = strip_median
+
+    if len(uniform_edges) < 2:
+        return None
+
+    # Stage 2: Build border similarity mask and scan inward
+    luma_tol = max(20.0, 3.5 * corner_std + 5.0)
+    sat_limit = 35.0
+    border_mask = (np.abs(luma - border_luma_ref) <= luma_tol) & (sat <= sat_limit)
+
+    max_crop_x = max(0, int(round(w * max_border_frac)))
+    max_crop_y = max(0, int(round(h * max_border_frac)))
+    left = _scan_uniform_margin(border_mask=border_mask, luma=luma, side="left", max_crop=max_crop_x) if "left" in uniform_edges else 0
+    right = _scan_uniform_margin(border_mask=border_mask, luma=luma, side="right", max_crop=max_crop_x) if "right" in uniform_edges else 0
+    top = _scan_uniform_margin(border_mask=border_mask, luma=luma, side="top", max_crop=max_crop_y) if "top" in uniform_edges else 0
+    bottom = _scan_uniform_margin(border_mask=border_mask, luma=luma, side="bottom", max_crop=max_crop_y) if "bottom" in uniform_edges else 0
+
+    # Corners already guarantee border existence; accept thin borders (>=3px).
+    min_side_px = 3
+    sides = sum(int(v >= min_side_px) for v in (left, right, top, bottom))
+    if sides < 2:
+        return None
+    total_border = left + right + top + bottom
+    if total_border < 8:
+        return None
+
+    # Build a soft mask: 1 inside the photo area, 0 in the border, with a
+    # smooth feather transition over ~8px for clean edges.
+    mask = np.zeros((h, w), dtype=np.float32)
+    x0, y0 = int(left), int(top)
+    x1, y1 = int(max(x0 + 1, w - right)), int(max(y0 + 1, h - bottom))
+    mask[y0:y1, x0:x1] = 1.0
+
+    # Feather the edges with iterative box blur (approximates Gaussian)
+    nonzero_margins = [v for v in (left, right, top, bottom) if v > 0]
+    feather_px = max(2, min(12, min(nonzero_margins) // 2)) if nonzero_margins else 4
+    k = feather_px * 2 + 1
+    half = k // 2
+    for _ in range(2):
+        # Horizontal pass
+        padded = np.pad(mask, ((0, 0), (half, half)), mode="edge")
+        cs = np.cumsum(padded, axis=1)
+        cs = np.concatenate([np.zeros((cs.shape[0], 1), dtype=cs.dtype), cs], axis=1)
+        mask = (cs[:, k:] - cs[:, :-k]) / k
+        # Vertical pass
+        padded = np.pad(mask, ((half, half), (0, 0)), mode="edge")
+        cs = np.cumsum(padded, axis=0)
+        cs = np.concatenate([np.zeros((1, cs.shape[1]), dtype=cs.dtype), cs], axis=0)
+        mask = (cs[k:, :] - cs[:-k, :]) / k
+    mask = np.clip(mask / max(float(mask.max()), 1e-6), 0.0, 1.0).astype(np.float32)
+
+    # Verify the photo area is a reasonable fraction
+    photo_frac = float(mask.mean())
+    if photo_frac < 0.30 or photo_frac > 0.995:
+        return None
+
+    return mask
+
+
 def _photoshop_color_blend(
     *,
     base_rgb_uint8: np.ndarray,
     blend_rgb_uint8: np.ndarray,
     opacity: float,
+    border_mask: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Photoshop Color blend: keep base luminance, take blend hue/chroma."""
+    """Photoshop Color blend: keep base luminance, take blend hue/chroma.
+
+    If border_mask is provided (H x W float32, 1=photo 0=border), the color
+    blend is only applied within the photo area; border pixels stay as base.
+    """
     base = base_rgb_uint8.astype(np.float32) / 255.0
     blend = blend_rgb_uint8.astype(np.float32) / 255.0
     opacity = float(np.clip(opacity, 0.0, 1.0))
 
     color_mode = _set_lum_rgb01(blend, _lum_rgb01(base))
-    out = (1.0 - opacity) * base + opacity * color_mode
+    blended = (1.0 - opacity) * base + opacity * color_mode
+
+    if border_mask is not None:
+        m = border_mask[..., None]  # H x W x 1
+        out = m * blended + (1.0 - m) * base
+    else:
+        out = blended
+
     return (np.clip(out, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+
+
+def _normalize_bw_base_for_overlay(
+    rgb_uint8: np.ndarray,
+    *,
+    black_clip: float,
+    white_clip: float,
+    midtone_target: float,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Neutralize sepia/cast to grayscale and apply robust tonal balancing."""
+    gray = (
+        0.299 * rgb_uint8[..., 0].astype(np.float32)
+        + 0.587 * rgb_uint8[..., 1].astype(np.float32)
+        + 0.114 * rgb_uint8[..., 2].astype(np.float32)
+    ) / 255.0
+    gray = np.clip(gray, 0.0, 1.0).astype(np.float32, copy=False)
+
+    lo_q = float(np.clip(black_clip, 0.0, 0.49))
+    hi_q = float(np.clip(1.0 - white_clip, 0.51, 1.0))
+    lo = float(np.quantile(gray, lo_q))
+    hi = float(np.quantile(gray, hi_q))
+    span = max(hi - lo, 1e-6)
+    leveled = np.clip((gray - lo) / span, 0.0, 1.0).astype(np.float32, copy=False)
+
+    med_before = float(np.quantile(leveled, 0.5))
+    target = float(np.clip(midtone_target, 0.05, 0.95))
+    gamma = 1.0
+    if 1e-4 < med_before < 0.9999:
+        gamma = float(np.clip(math.log(target) / math.log(med_before), 0.60, 1.80))
+        leveled = np.power(leveled, gamma).astype(np.float32, copy=False)
+    med_after = float(np.quantile(leveled, 0.5))
+
+    out_gray = (np.clip(leveled, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    out_rgb = np.stack([out_gray, out_gray, out_gray], axis=-1)
+    stats = {
+        "black_clip": float(black_clip),
+        "white_clip": float(white_clip),
+        "midtone_target": float(target),
+        "black_level_q": float(lo),
+        "white_level_q": float(hi),
+        "gamma": float(gamma),
+        "median_before": float(med_before),
+        "median_after": float(med_after),
+    }
+    return out_rgb, stats
 
 
 def _pil_to_tensor(img: Image.Image, *, device: torch.device) -> torch.Tensor:
@@ -886,6 +1192,177 @@ def _trim_correspondences_for_prealign(
     return src_pts, ref_pts, False
 
 
+def _warp_compose(
+    *,
+    warp_base: torch.Tensor,
+    warp_delta: torch.Tensor,
+) -> torch.Tensor:
+    """Compose two ref->src normalized warps at identical map resolution.
+
+    base: ref -> src_orig
+    delta: ref -> src_base_warped
+    result: ref -> src_orig
+    """
+    if warp_base.ndim != 3 or warp_delta.ndim != 3:
+        raise ValueError("warp_base and warp_delta must be [H, W, 2] tensors.")
+    if warp_base.shape[-1] != 2 or warp_delta.shape[-1] != 2:
+        raise ValueError("warp tensors must have channel dimension 2.")
+    if warp_base.shape[:2] != warp_delta.shape[:2]:
+        raise ValueError("warp_base and warp_delta must have same spatial shape.")
+
+    base_bchw = warp_base.permute(2, 0, 1).unsqueeze(0)
+    delta_bhw2 = warp_delta.unsqueeze(0)
+    comp = F.grid_sample(
+        base_bchw,
+        delta_bhw2,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=False,
+    )[0].permute(1, 2, 0)
+    return comp.clamp(-1.0, 1.0)
+
+
+def _map_scalar_through_warp(
+    *,
+    scalar_map: torch.Tensor,
+    warp: torch.Tensor,
+) -> torch.Tensor:
+    """Sample scalar_map [H, W] at normalized warp coordinates [H, W, 2]."""
+    if scalar_map.ndim != 2 or warp.ndim != 3 or warp.shape[-1] != 2:
+        raise ValueError("scalar_map must be [H,W] and warp must be [H,W,2].")
+    sampled = F.grid_sample(
+        scalar_map.unsqueeze(0).unsqueeze(0),
+        warp.unsqueeze(0),
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=False,
+    )[0, 0]
+    return sampled
+
+
+def _normalized_grid_hw(*, h: int, w: int, device: torch.device) -> torch.Tensor:
+    y = torch.linspace(-1 + 1 / h, 1 - 1 / h, h, device=device, dtype=torch.float32)
+    x = torch.linspace(-1 + 1 / w, 1 - 1 / w, w, device=device, dtype=torch.float32)
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+    return torch.stack((xx, yy), dim=-1)
+
+
+def _rgb_chw_to_luma(img_chw: torch.Tensor) -> torch.Tensor:
+    if img_chw.ndim != 3 or img_chw.shape[0] != 3:
+        raise ValueError("img_chw must be [3,H,W].")
+    r = img_chw[0]
+    g = img_chw[1]
+    b = img_chw[2]
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b).float()
+
+
+def _robust_normalize_2d(gray: torch.Tensor) -> torch.Tensor:
+    if gray.ndim != 2:
+        raise ValueError("gray must be [H,W].")
+    flat = gray.reshape(-1)
+    lo = torch.quantile(flat, 0.02)
+    hi = torch.quantile(flat, 0.98)
+    span = (hi - lo).clamp(min=1e-5)
+    return ((gray - lo) / span).clamp(0.0, 1.0)
+
+
+def _edge_magnitude_2d(gray: torch.Tensor) -> torch.Tensor:
+    if gray.ndim != 2:
+        raise ValueError("gray must be [H,W].")
+    h, w = int(gray.shape[0]), int(gray.shape[1])
+    if w > 1:
+        dx = gray[:, 1:] - gray[:, :-1]
+        dx = torch.cat((dx, dx[:, -1:]), dim=1)
+    else:
+        dx = torch.zeros_like(gray)
+    if h > 1:
+        dy = gray[1:, :] - gray[:-1, :]
+        dy = torch.cat((dy, dy[-1:, :]), dim=0)
+    else:
+        dy = torch.zeros_like(gray)
+    return torch.sqrt(dx * dx + dy * dy + 1e-12)
+
+
+def _weighted_mae(a: torch.Tensor, b: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    if a.shape != b.shape or a.shape != weight.shape:
+        raise ValueError("a, b, and weight must have identical shapes.")
+    w = weight.clamp(min=0.0)
+    denom = w.sum().clamp(min=1e-6)
+    return (torch.abs(a - b) * w).sum() / denom
+
+
+def _alignment_score_from_warp(
+    *,
+    ref_luma_full: torch.Tensor,
+    src_tensor_full: torch.Tensor,
+    warp_small: torch.Tensor,
+    overlap_small: torch.Tensor | None,
+    out_h: int,
+    out_w: int,
+) -> dict[str, float]:
+    if warp_small.ndim != 3 or warp_small.shape[-1] != 2:
+        raise ValueError("warp_small must be [H,W,2].")
+    warp_full = F.interpolate(
+        warp_small.permute(2, 0, 1).unsqueeze(0),
+        size=(out_h, out_w),
+        mode="bilinear",
+        align_corners=False,
+    )[0].permute(1, 2, 0)
+    warped = F.grid_sample(
+        src_tensor_full,
+        warp_full.unsqueeze(0),
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=False,
+    )[0]
+    src_luma = _robust_normalize_2d(_rgb_chw_to_luma(warped))
+    ref_norm = _robust_normalize_2d(ref_luma_full)
+
+    in_bounds = warp_full.abs().amax(dim=-1).le(1.0).float()
+    if overlap_small is not None:
+        overlap_full = F.interpolate(
+            overlap_small.unsqueeze(0).unsqueeze(0),
+            size=(out_h, out_w),
+            mode="bilinear",
+            align_corners=False,
+        )[0, 0].clamp(0.0, 1.0)
+        weight = in_bounds * (0.15 + 0.85 * overlap_full)
+    else:
+        weight = in_bounds
+
+    yy = torch.linspace(-1.0, 1.0, out_h, dtype=torch.float32, device=weight.device)
+    xx = torch.linspace(-1.0, 1.0, out_w, dtype=torch.float32, device=weight.device)
+    yy, xx = torch.meshgrid(yy, xx, indexing="ij")
+    radial = torch.sqrt(xx * xx + yy * yy) / math.sqrt(2.0)
+    center_weight = (1.0 - 0.35 * radial).clamp(0.65, 1.0)
+    weight = weight * center_weight
+
+    luma_mae = _weighted_mae(ref_norm, src_luma, weight)
+    ref_edge = _robust_normalize_2d(_edge_magnitude_2d(ref_norm))
+    src_edge = _robust_normalize_2d(_edge_magnitude_2d(src_luma))
+    edge_mae = _weighted_mae(ref_edge, src_edge, weight)
+    score = 0.40 * luma_mae + 0.60 * edge_mae
+    return {
+        "score": float(score.item()),
+        "luma_mae": float(luma_mae.item()),
+        "edge_mae": float(edge_mae.item()),
+        "coverage": float((in_bounds > 0.5).float().mean().item()),
+    }
+
+
+def _match_with_current_model(
+    *,
+    model,
+    ref_img: Image.Image,
+    src_tensor: torch.Tensor,
+):
+    """Match ref against a tensor source by converting to PIL in-memory."""
+    src_uint8 = _tensor_chw_to_uint8(src_tensor[0])
+    src_pil = Image.fromarray(src_uint8)
+    preds = model.match(ref_img, src_pil)
+    return preds, src_pil
+
+
 def main() -> int:
     args = parse_args()
     run_start = perf_counter()
@@ -928,6 +1405,24 @@ def main() -> int:
     if not (0.0 <= float(args.color_opacity) <= 1.0):
         print("[ERROR] --color-opacity must be in [0, 1].", file=sys.stderr)
         return 1
+    if float(args.chroma_boost) <= 0.0:
+        print("[ERROR] --chroma-boost must be > 0.", file=sys.stderr)
+        return 1
+    if not (0.0 <= float(args.chroma_edge_preserve) <= 1.0):
+        print("[ERROR] --chroma-edge-preserve must be in [0, 1].", file=sys.stderr)
+        return 1
+    if not (0.0 <= float(args.bw_black_point_clip) < 0.20):
+        print("[ERROR] --bw-black-point-clip must be in [0, 0.20).", file=sys.stderr)
+        return 1
+    if not (0.0 <= float(args.bw_white_point_clip) < 0.20):
+        print("[ERROR] --bw-white-point-clip must be in [0, 0.20).", file=sys.stderr)
+        return 1
+    if float(args.bw_black_point_clip + args.bw_white_point_clip) >= 0.40:
+        print("[ERROR] --bw-black-point-clip + --bw-white-point-clip must be < 0.40.", file=sys.stderr)
+        return 1
+    if not (0.05 <= float(args.bw_midtone_target) <= 0.95):
+        print("[ERROR] --bw-midtone-target must be in [0.05, 0.95].", file=sys.stderr)
+        return 1
     if not (0.0 <= float(args.border_crop_max_frac) <= 0.45):
         print("[ERROR] --border-crop-max-frac must be in [0, 0.45].", file=sys.stderr)
         return 1
@@ -961,6 +1456,15 @@ def main() -> int:
     if float(args.prealign_overlap_margin) < 0.0:
         print("[ERROR] --prealign-overlap-margin must be >= 0.", file=sys.stderr)
         return 1
+    if int(args.iterative_rematch_passes) < 0:
+        print("[ERROR] --iterative-rematch-passes must be >= 0.", file=sys.stderr)
+        return 1
+    if float(args.iterative_rematch_overlap_margin) < 0.0:
+        print("[ERROR] --iterative-rematch-overlap-margin must be >= 0.", file=sys.stderr)
+        return 1
+    if float(args.iterative_rematch_mae_margin) < 0.0:
+        print("[ERROR] --iterative-rematch-mae-margin must be >= 0.", file=sys.stderr)
+        return 1
 
     effective_setting = str(args.setting)
     effective_global_prealign_enabled = not bool(args.disable_global_prealign)
@@ -971,30 +1475,33 @@ def main() -> int:
     effective_prealign_conf_quantile = float(args.prealign_confidence_quantile)
     effective_prealign_border_trim_frac = float(args.prealign_border_trim_frac)
     effective_prealign_overlap_margin = float(args.prealign_overlap_margin)
+    effective_iterative_rematch_passes = int(args.iterative_rematch_passes)
+    effective_iterative_rematch_overlap_margin = float(args.iterative_rematch_overlap_margin)
+    effective_iterative_rematch_mae_margin = float(args.iterative_rematch_mae_margin)
 
     if args.accuracy_mode:
-        if effective_setting != "precise":
-            print(
-                f"[INFO] Accuracy mode enabled: overriding setting '{effective_setting}' -> 'precise'."
-            )
-        effective_setting = "precise"
         if not effective_global_prealign_enabled:
             print("[INFO] Accuracy mode enabled: re-enabling global pre-alignment.")
         effective_global_prealign_enabled = True
         effective_multi_pass_global_align = True
-        effective_prealign_ransac_iters = max(effective_prealign_ransac_iters, 1400)
-        effective_prealign_min_samples = max(effective_prealign_min_samples, 3000)
-        effective_prealign_sample_cap = max(effective_prealign_sample_cap, 10000)
-        effective_prealign_conf_quantile = max(effective_prealign_conf_quantile, 0.65)
-        effective_prealign_border_trim_frac = max(effective_prealign_border_trim_frac, 0.08)
-        effective_prealign_overlap_margin = max(effective_prealign_overlap_margin, 0.002)
+        effective_prealign_ransac_iters = max(effective_prealign_ransac_iters, 2400)
+        effective_prealign_min_samples = max(effective_prealign_min_samples, 5000)
+        effective_prealign_sample_cap = max(effective_prealign_sample_cap, 18000)
+        effective_prealign_conf_quantile = max(effective_prealign_conf_quantile, 0.70)
+        effective_prealign_border_trim_frac = max(effective_prealign_border_trim_frac, 0.10)
+        effective_prealign_overlap_margin = min(effective_prealign_overlap_margin, 0.0015)
+        effective_iterative_rematch_passes = max(effective_iterative_rematch_passes, 5)
+        effective_iterative_rematch_overlap_margin = min(effective_iterative_rematch_overlap_margin, 0.0005)
+        effective_iterative_rematch_mae_margin = min(effective_iterative_rematch_mae_margin, 0.00025)
         print(
             "[INFO] Accuracy mode parameters: "
             f"multi-pass={effective_multi_pass_global_align}, "
             f"ransac_iters={effective_prealign_ransac_iters}, "
             f"samples={effective_prealign_min_samples}-{effective_prealign_sample_cap}, "
             f"conf_q={effective_prealign_conf_quantile:.2f}, "
-            f"border_trim={effective_prealign_border_trim_frac:.2f}."
+            f"border_trim={effective_prealign_border_trim_frac:.2f}, "
+            f"iterative_passes={effective_iterative_rematch_passes}, "
+            f"iterative_mae_margin={effective_iterative_rematch_mae_margin:.4f}."
         )
 
     args.outdir.mkdir(parents=True, exist_ok=True)
@@ -1032,6 +1539,15 @@ def main() -> int:
         "global_prealign_ransac_iters": int(effective_prealign_ransac_iters),
         "global_prealign_multi_pass_enabled": bool(effective_multi_pass_global_align),
         "global_prealign_overlap_margin": float(effective_prealign_overlap_margin),
+        "iterative_rematch_requested_passes": int(effective_iterative_rematch_passes),
+        "iterative_rematch_passes_run": 0,
+        "iterative_rematch_passes_accepted": 0,
+        "iterative_rematch_overlap_margin": float(effective_iterative_rematch_overlap_margin),
+        "iterative_rematch_mae_margin": float(effective_iterative_rematch_mae_margin),
+        "iterative_rematch_applied": False,
+        "iterative_rematch_score_start": None,
+        "iterative_rematch_score_final": None,
+        "iterative_rematch_pass_metrics": [],
     }
 
     if not args.disable_auto_border_crop:
@@ -1094,12 +1610,30 @@ def main() -> int:
     torch.set_float32_matmul_precision("highest")
     cuda_available = torch.cuda.is_available()
     torch_build = str(torch.__version__)
+    gpu_runtime_snapshot: dict[str, float] | None = None
     if cuda_available:
         try:
             device_name = torch.cuda.get_device_name(0)
         except Exception:
             device_name = "Unknown CUDA device"
         print(f"[INFO] Runtime device: CUDA ({device_name})")
+        gpu_runtime_snapshot = _query_nvidia_gpu_snapshot()
+        if gpu_runtime_snapshot is not None:
+            mem_used = int(gpu_runtime_snapshot["memory_used_mib"])
+            mem_total = int(gpu_runtime_snapshot["memory_total_mib"])
+            mem_ratio = float(gpu_runtime_snapshot["memory_ratio"])
+            util = float(gpu_runtime_snapshot["utilization_percent"])
+            temp_c = float(gpu_runtime_snapshot["temperature_c"])
+            print(
+                "[INFO] GPU status before model init: "
+                f"util={util:.0f}%, mem={mem_used}/{mem_total} MiB ({mem_ratio * 100.0:.0f}%), temp={temp_c:.0f}C"
+            )
+            if mem_ratio >= 0.80 or util >= 70.0 or temp_c >= 84.0:
+                print(
+                    "[WARN] GPU is currently busy or hot before model init. "
+                    "This can make init/matching dramatically slower. "
+                    "Close other GPU-heavy apps (e.g., other Python jobs, Ollama, Lightroom) and retry."
+                )
     else:
         build_hint = "CPU-only torch build detected" if "+cpu" in torch_build else "CUDA runtime unavailable"
         print(
@@ -1306,6 +1840,213 @@ def main() -> int:
         except Exception as exc:
             print(f"[WARN] Global pre-align failed: {exc}")
         print(f"[TIMING] Global pre-alignment stage: {perf_counter() - prealign_stage_start:.2f}s")
+
+    if int(effective_iterative_rematch_passes) > 0:
+        rematch_stage_start = perf_counter()
+        print(
+            "[INFO] Iterative re-match refinement: "
+            f"requested_passes={int(effective_iterative_rematch_passes)}, "
+            f"overlap_margin={float(effective_iterative_rematch_overlap_margin):.4f}, "
+            f"mae_margin={float(effective_iterative_rematch_mae_margin):.4f}."
+        )
+        src_tensor_for_rematch = _pil_to_tensor(src_img, device=roma_device)
+        ref_tensor_for_score = _pil_to_tensor(ref_img, device=roma_device)[0]
+        ref_luma_for_score = _rgb_chw_to_luma(ref_tensor_for_score)
+        warp_current_t = preds.get("warp_AB")
+        if not isinstance(warp_current_t, torch.Tensor):
+            print("[WARN] Iterative re-match skipped: warp_AB unavailable.")
+        else:
+            warp_current = warp_current_t[0].detach()
+            overlap_current: torch.Tensor | None = None
+            overlap_current_t = preds.get("overlap_AB")
+            if isinstance(overlap_current_t, torch.Tensor):
+                overlap_current = overlap_current_t[0, ..., 0].detach().clamp(0.0, 1.0)
+
+            map_h, map_w = int(warp_current.shape[0]), int(warp_current.shape[1])
+            identity_grid = _normalized_grid_hw(h=map_h, w=map_w, device=warp_current.device)
+            current_eval = _alignment_score_from_warp(
+                ref_luma_full=ref_luma_for_score,
+                src_tensor_full=src_tensor_for_rematch,
+                warp_small=warp_current,
+                overlap_small=overlap_current,
+                out_h=ref_h,
+                out_w=ref_w,
+            )
+            current_score = float(current_eval["score"])
+            current_coverage = float(current_eval["coverage"])
+            preprocessing["iterative_rematch_score_start"] = current_score
+            preprocessing["iterative_rematch_score_final"] = current_score
+
+            for rematch_idx in range(int(effective_iterative_rematch_passes)):
+                pass_num = rematch_idx + 1
+                preprocessing["iterative_rematch_passes_run"] = int(
+                    preprocessing["iterative_rematch_passes_run"]
+                ) + 1
+                print(f"[INFO] Iterative re-match pass {pass_num}: warping current source and matching again...")
+
+                warp_current_full = F.interpolate(
+                    warp_current.permute(2, 0, 1).unsqueeze(0),
+                    size=(ref_h, ref_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )[0].permute(1, 2, 0)
+                rematch_src_tensor = F.grid_sample(
+                    src_tensor_for_rematch,
+                    warp_current_full.unsqueeze(0),
+                    mode="bilinear",
+                    padding_mode="border",
+                    align_corners=False,
+                )
+                preds_delta, _ = _match_with_current_model(
+                    model=model,
+                    ref_img=ref_img,
+                    src_tensor=rematch_src_tensor,
+                )
+
+                warp_delta_t = preds_delta.get("warp_AB")
+                if not isinstance(warp_delta_t, torch.Tensor):
+                    print(f"[WARN] Iterative re-match pass {pass_num} skipped: delta warp unavailable.")
+                    break
+                warp_delta = warp_delta_t[0].detach()
+                if tuple(warp_delta.shape[:2]) != (map_h, map_w):
+                    warp_delta = F.interpolate(
+                        warp_delta.permute(2, 0, 1).unsqueeze(0),
+                        size=(map_h, map_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )[0].permute(1, 2, 0)
+
+                overlap_delta: torch.Tensor | None = None
+                overlap_delta_t = preds_delta.get("overlap_AB")
+                if isinstance(overlap_delta_t, torch.Tensor):
+                    overlap_delta = overlap_delta_t[0, ..., 0].detach().clamp(0.0, 1.0)
+                    if tuple(overlap_delta.shape[:2]) != (map_h, map_w):
+                        overlap_delta = F.interpolate(
+                            overlap_delta.unsqueeze(0).unsqueeze(0),
+                            size=(map_h, map_w),
+                            mode="bilinear",
+                            align_corners=False,
+                        )[0, 0]
+
+                candidate_warp = _warp_compose(
+                    warp_base=warp_current,
+                    warp_delta=warp_delta,
+                )
+
+                overlap_candidate: torch.Tensor | None = None
+                sampled_current_overlap: torch.Tensor | None = None
+                if overlap_current is not None:
+                    sampled_current_overlap = _map_scalar_through_warp(
+                        scalar_map=overlap_current,
+                        warp=warp_delta,
+                    ).clamp(0.0, 1.0)
+                if sampled_current_overlap is not None and overlap_delta is not None:
+                    overlap_candidate = (
+                        0.5 * sampled_current_overlap + 0.5 * overlap_delta
+                    ).clamp(0.0, 1.0)
+                elif overlap_delta is not None:
+                    overlap_candidate = overlap_delta
+                elif sampled_current_overlap is not None:
+                    overlap_candidate = sampled_current_overlap
+
+                candidate_eval = _alignment_score_from_warp(
+                    ref_luma_full=ref_luma_for_score,
+                    src_tensor_full=src_tensor_for_rematch,
+                    warp_small=candidate_warp,
+                    overlap_small=overlap_candidate,
+                    out_h=ref_h,
+                    out_w=ref_w,
+                )
+                candidate_score = float(candidate_eval["score"])
+                mae_gain = float(current_score - candidate_score)
+                overlap_before = (
+                    float(overlap_current.mean().item()) if overlap_current is not None else None
+                )
+                overlap_after = (
+                    float(overlap_candidate.mean().item()) if overlap_candidate is not None else None
+                )
+                overlap_gain = (
+                    float(overlap_after - overlap_before)
+                    if overlap_before is not None and overlap_after is not None
+                    else None
+                )
+
+                delta_disp = torch.linalg.vector_norm(warp_delta - identity_grid, dim=-1)
+                delta_disp_mean = float(delta_disp.mean().item())
+                converged = delta_disp_mean < 0.0012
+                accept_by_mae = mae_gain >= float(effective_iterative_rematch_mae_margin)
+                accept_by_overlap_tie = (
+                    mae_gain >= 0.0
+                    and overlap_gain is not None
+                    and overlap_gain >= float(effective_iterative_rematch_overlap_margin)
+                )
+                coverage_drop_too_large = (
+                    float(candidate_eval["coverage"]) + 0.08 < current_coverage
+                )
+                update_pass = (accept_by_mae or accept_by_overlap_tie) and not coverage_drop_too_large
+
+                metrics_entry = {
+                    "pass": int(pass_num),
+                    "score_before": current_score,
+                    "score_after": candidate_score,
+                    "score_gain": mae_gain,
+                    "evaluated_overlap": overlap_after,
+                    "evaluated_luma_mae": float(candidate_eval["luma_mae"]),
+                    "evaluated_edge_mae": float(candidate_eval["edge_mae"]),
+                    "evaluated_coverage": float(candidate_eval["coverage"]),
+                    "delta_disp_mean": delta_disp_mean,
+                    "update_applied": bool(update_pass),
+                    "converged": bool(converged),
+                }
+                if overlap_before is not None:
+                    metrics_entry["overlap_before"] = overlap_before
+                if overlap_gain is not None:
+                    metrics_entry["overlap_gain"] = overlap_gain
+                pass_metrics = preprocessing.get("iterative_rematch_pass_metrics")
+                if isinstance(pass_metrics, list):
+                    pass_metrics.append(metrics_entry)
+
+                if converged:
+                    print(
+                        f"[INFO] Iterative re-match pass {pass_num}: converged "
+                        f"(delta displacement mean={delta_disp_mean:.5f})."
+                    )
+                    break
+
+                if not update_pass:
+                    print(
+                        f"[INFO] Iterative re-match pass {pass_num}: rejected "
+                        f"(score gain={mae_gain:+.5f}, overlap gain="
+                        + (f"{overlap_gain:+.4f}" if overlap_gain is not None else "n/a")
+                        + f", coverage={float(candidate_eval['coverage']):.3f}"
+                        + ")."
+                    )
+                    break
+
+                warp_current = candidate_warp
+                overlap_current = overlap_candidate
+                current_score = candidate_score
+                current_coverage = float(candidate_eval["coverage"])
+                preprocessing["iterative_rematch_passes_accepted"] = int(
+                    preprocessing["iterative_rematch_passes_accepted"]
+                ) + 1
+                preprocessing["iterative_rematch_applied"] = True
+                preprocessing["iterative_rematch_score_final"] = current_score
+
+                print(
+                    f"[INFO] Iterative re-match pass {pass_num}: accepted "
+                    f"(score gain={mae_gain:+.5f}, score={current_score:.5f})."
+                )
+
+            preds["warp_AB"] = warp_current.unsqueeze(0)
+            if overlap_current is not None:
+                preds["overlap_AB"] = overlap_current.unsqueeze(0).unsqueeze(-1)
+            if preprocessing["iterative_rematch_score_final"] is None:
+                preprocessing["iterative_rematch_score_final"] = current_score
+
+        print(
+            f"[TIMING] Iterative re-match stage: {perf_counter() - rematch_stage_start:.2f}s"
+        )
 
     pred_shapes: dict[str, dict[str, object] | None] = {}
     stage_start = perf_counter()
@@ -1638,8 +2379,17 @@ def main() -> int:
 
     # --- Photoshop-style Color blend transfer ---
     stage_start = perf_counter()
+    color_transfer_donor_stage = "none"
+    color_transfer_chroma_scale_applied = 1.0
+    color_transfer_adaptive_ratio = 1.0
+    color_transfer_chroma_edge_preserve = float(args.chroma_edge_preserve)
+    color_transfer_low_conf_chroma_fill = False
+    color_transfer_low_conf_fill_ratio = 0.0
+    color_transfer_low_conf_fill_stage = "none"
+    color_transfer_bw_base_balanced = False
+    color_transfer_bw_base_stats: dict[str, float] | None = None
     if not args.no_color_transfer:
-        # Prefer regularized warp donor, then smooth, then raw.
+        # Prefer regularized warp donor to reduce low-overlap artifacts, then smoothed, then raw.
         if warped_regularized_tensor is not None:
             color_donor = warped_regularized_tensor
             donor_stage = "regularized"
@@ -1649,29 +2399,154 @@ def main() -> int:
         else:
             color_donor = warped_src
             donor_stage = "raw"
+        color_transfer_donor_stage = donor_stage
         donor_rgb = _tensor_chw_to_uint8(color_donor)
         ref_rgb = np.asarray(ref_img.convert("RGB"), dtype=np.uint8)
+        if args.disable_bw_gray_balance:
+            ref_overlay_rgb = ref_rgb
+            print("[INFO] B&W overlay base normalization disabled (--disable-bw-gray-balance).")
+        else:
+            ref_overlay_rgb, color_transfer_bw_base_stats = _normalize_bw_base_for_overlay(
+                ref_rgb,
+                black_clip=float(args.bw_black_point_clip),
+                white_clip=float(args.bw_white_point_clip),
+                midtone_target=float(args.bw_midtone_target),
+            )
+            color_transfer_bw_base_balanced = True
+            ref_overlay_path = args.outdir / "bw_overlay_base_balanced.png"
+            Image.fromarray(ref_overlay_rgb).save(ref_overlay_path)
+            output_files.append(ref_overlay_path)
+            print(
+                "[INFO] B&W base normalized for overlay: "
+                f"black_q={color_transfer_bw_base_stats['black_level_q']:.3f}, "
+                f"white_q={color_transfer_bw_base_stats['white_level_q']:.3f}, "
+                f"gamma={color_transfer_bw_base_stats['gamma']:.3f}, "
+                f"median={color_transfer_bw_base_stats['median_before']:.3f}"
+                f"->{color_transfer_bw_base_stats['median_after']:.3f}."
+            )
+        donor_lab = _rgb_to_lab(donor_rgb)
+
+        # If regularization used reference fallback in low-overlap zones, chroma there can collapse to gray.
+        # Re-inject chroma from a non-regularized donor in low-confidence regions so color covers the full image.
+        if donor_stage == "regularized":
+            if warped_src_smooth is not None:
+                fill_rgb = _tensor_chw_to_uint8(warped_src_smooth)
+                fill_stage = "smooth"
+            else:
+                fill_rgb = _tensor_chw_to_uint8(warped_src)
+                fill_stage = "raw"
+            fill_lab = _rgb_to_lab(fill_rgb)
+
+            if overlap_full is not None:
+                tau = float(args.regularize_overlap_thresh)
+                denom = max(1e-6, 1.0 - tau)
+                conf = np.clip(
+                    (overlap_full.detach().cpu().numpy() - tau) / denom,
+                    0.0,
+                    1.0,
+                ).astype(np.float32, copy=False)
+            else:
+                conf = np.ones((ref_h, ref_w), dtype=np.float32)
+
+            low_conf = 1.0 - conf
+            donor_lab[..., 1:3] = (
+                donor_lab[..., 1:3] * conf[..., None] + fill_lab[..., 1:3] * low_conf[..., None]
+            )
+            color_transfer_low_conf_chroma_fill = True
+            color_transfer_low_conf_fill_ratio = float(low_conf.mean())
+            color_transfer_low_conf_fill_stage = fill_stage
+            print(
+                "[INFO] Low-confidence chroma fill: "
+                f"donor={fill_stage}, low-conf area={color_transfer_low_conf_fill_ratio * 100.0:.1f}%."
+            )
 
         chroma_radius = int(args.chroma_filter_radius)
         if chroma_radius > 0:
             # Smooth donor chroma with reference luminance as guide.
             ref_gray = np.asarray(ref_img.convert("L"), dtype=np.float32) / 255.0
-            donor_lab = _rgb_to_lab(donor_rgb)
-            donor_ab = _guided_filter_with_mp_limit(
+            donor_ab_raw = donor_lab[..., 1:3].astype(np.float32, copy=True)
+            donor_ab_smooth = _guided_filter_with_mp_limit(
                 guide=ref_gray,
-                src=donor_lab[..., 1:3].astype(np.float32, copy=False),
+                src=donor_ab_raw,
                 radius=chroma_radius,
                 eps=args.guided_filter_eps,
                 max_megapixels=float(args.filter_max_megapixels),
             )
+            edge_preserve_strength = float(args.chroma_edge_preserve)
+            if edge_preserve_strength > 0.0:
+                gx = np.zeros_like(ref_gray, dtype=np.float32)
+                gy = np.zeros_like(ref_gray, dtype=np.float32)
+                gx[:, 1:] = np.abs(ref_gray[:, 1:] - ref_gray[:, :-1])
+                gy[1:, :] = np.abs(ref_gray[1:, :] - ref_gray[:-1, :])
+                edge_mag = np.sqrt(gx * gx + gy * gy).astype(np.float32, copy=False)
+                edge_q90 = float(np.quantile(edge_mag, 0.90)) if edge_mag.size else 0.0
+                edge_scale = max(edge_q90, 1e-4)
+                edge_norm = np.clip(edge_mag / edge_scale, 0.0, 1.0).astype(np.float32, copy=False)
+                edge_weight = np.power(edge_norm, 0.7).astype(np.float32, copy=False)
+                edge_weight = np.clip(edge_weight * edge_preserve_strength, 0.0, 1.0).astype(
+                    np.float32, copy=False
+                )
+                donor_ab = donor_ab_smooth * (1.0 - edge_weight[..., None]) + donor_ab_raw * edge_weight[..., None]
+                print(
+                    "[INFO] Chroma edge-preserve blend: "
+                    f"strength={edge_preserve_strength:.2f}, edge_q90={edge_q90:.5f}"
+                )
+            else:
+                donor_ab = donor_ab_smooth
             donor_lab[..., 1:3] = donor_ab
-            donor_rgb = _lab_to_rgb(donor_lab)
             print(f"[INFO] Chrominance guided filter: radius={chroma_radius}")
 
+        chroma_scale = float(args.chroma_boost)
+        if args.adaptive_chroma_match:
+            # Match donor chroma spread to the C1 source image using robust quantiles.
+            src_resized = np.asarray(
+                src_img.resize((ref_w, ref_h), resample=_resample_bicubic()).convert("RGB"),
+                dtype=np.uint8,
+            )
+            src_lab = _rgb_to_lab(src_resized)
+            src_chroma = np.sqrt(src_lab[..., 1] ** 2 + src_lab[..., 2] ** 2).reshape(-1)
+            donor_chroma = np.sqrt(donor_lab[..., 1] ** 2 + donor_lab[..., 2] ** 2).reshape(-1)
+            src_q = float(np.quantile(src_chroma, 0.85)) if src_chroma.size else 0.0
+            donor_q = float(np.quantile(donor_chroma, 0.85)) if donor_chroma.size else 0.0
+            if np.isfinite(src_q) and np.isfinite(donor_q) and donor_q > 1e-6:
+                adaptive_ratio = float(np.clip(src_q / donor_q, 0.80, 1.45))
+                color_transfer_adaptive_ratio = adaptive_ratio
+                chroma_scale *= adaptive_ratio
+            else:
+                color_transfer_adaptive_ratio = 1.0
+            print(
+                "[INFO] Adaptive chroma match: "
+                f"src_q85={src_q:.2f}, donor_q85={donor_q:.2f}, "
+                f"ratio={color_transfer_adaptive_ratio:.3f}"
+            )
+
+        color_transfer_chroma_scale_applied = chroma_scale
+        if abs(chroma_scale - 1.0) > 1e-4:
+            donor_lab[..., 1:3] *= np.float32(chroma_scale)
+            donor_lab[..., 1:3] = np.clip(donor_lab[..., 1:3], -128.0, 127.0)
+            print(f"[INFO] Chroma boost applied: total_scale={chroma_scale:.3f}")
+
+        donor_rgb = _lab_to_rgb(donor_lab)
+
+        # Detect border mask if requested
+        border_mask = None
+        if args.border_exclude_mask:
+            print("[INFO] Border exclusion: detecting photo border on reference image...")
+            border_mask = _detect_border_mask(ref_overlay_rgb, max_border_frac=0.25)
+            if border_mask is not None:
+                photo_pct = float(border_mask.mean()) * 100
+                print(f"[INFO] Border exclusion: detected border. Photo area is {photo_pct:.1f}% of image.")
+                border_mask_path = args.outdir / "border_mask.png"
+                Image.fromarray((border_mask * 255).astype(np.uint8)).save(border_mask_path)
+                print(f"[INFO] Border exclusion: saved mask -> border_mask.png")
+            else:
+                print("[INFO] Border exclusion: no significant border detected, applying color everywhere.")
+
         final_rgb = _photoshop_color_blend(
-            base_rgb_uint8=ref_rgb,
+            base_rgb_uint8=ref_overlay_rgb,
             blend_rgb_uint8=donor_rgb,
             opacity=float(args.color_opacity),
+            border_mask=border_mask,
         )
 
         final_colorized_path = args.outdir / "final_colorized.png"
@@ -1680,7 +2555,10 @@ def main() -> int:
 
         print(
             "[INFO] Saved Photoshop-style Color blend result "
-            f"(donor={donor_stage}, opacity={float(args.color_opacity):.2f}) -> final_colorized.png"
+            "(donor="
+            f"{donor_stage}, opacity={float(args.color_opacity):.2f}, "
+            f"chroma_scale={color_transfer_chroma_scale_applied:.3f}, "
+            f"border_excluded={border_mask is not None}) -> final_colorized.png"
         )
     else:
         print("[INFO] Color transfer disabled (--no-color-transfer).")
@@ -1760,6 +2638,7 @@ def main() -> int:
         "torch_version": torch.__version__,
         "cuda_available": torch.cuda.is_available(),
         "cuda_device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "runtime_gpu_snapshot": gpu_runtime_snapshot,
         "roma_device": str(roma_device),
         "inputs": {
             "ref_path": str(args.ref.resolve()),
@@ -1793,8 +2672,19 @@ def main() -> int:
         "color_transfer": {
             "enabled": not args.no_color_transfer,
             "method": "Photoshop-style Color blend (base luminance + donor color)",
+            "donor_stage": color_transfer_donor_stage,
+            "bw_base_balanced": bool(color_transfer_bw_base_balanced),
+            "bw_base_balance_stats": color_transfer_bw_base_stats,
             "chroma_filter_radius": int(args.chroma_filter_radius),
+            "chroma_edge_preserve": float(color_transfer_chroma_edge_preserve),
+            "low_conf_chroma_fill": bool(color_transfer_low_conf_chroma_fill),
+            "low_conf_chroma_fill_ratio": float(color_transfer_low_conf_fill_ratio),
+            "low_conf_chroma_fill_donor_stage": color_transfer_low_conf_fill_stage,
             "opacity": float(args.color_opacity),
+            "chroma_boost": float(args.chroma_boost),
+            "adaptive_chroma_match": bool(args.adaptive_chroma_match),
+            "adaptive_chroma_ratio": float(color_transfer_adaptive_ratio),
+            "chroma_scale_applied": float(color_transfer_chroma_scale_applied),
         },
         "performance": {
             "diag_max_side": int(args.diag_max_side),
@@ -1808,6 +2698,9 @@ def main() -> int:
             "prealign_confidence_quantile": float(effective_prealign_conf_quantile),
             "prealign_border_trim_frac": float(effective_prealign_border_trim_frac),
             "prealign_overlap_margin": float(effective_prealign_overlap_margin),
+            "iterative_rematch_passes": int(effective_iterative_rematch_passes),
+            "iterative_rematch_overlap_margin": float(effective_iterative_rematch_overlap_margin),
+            "iterative_rematch_mae_margin": float(effective_iterative_rematch_mae_margin),
         },
         "metrics": {
             "computed_on": [int(diag_w), int(diag_h)],
@@ -1887,7 +2780,28 @@ def main() -> int:
         f"guided_filter_radius: {gf_radius}",
         f"guided_filter_eps: {args.guided_filter_eps}",
         f"color_transfer: {'enabled' if not args.no_color_transfer else 'disabled'}",
+        f"bw_gray_balance_enabled: {not bool(args.disable_bw_gray_balance)}",
+        f"bw_base_balanced: {bool(color_transfer_bw_base_balanced)}",
+        (
+            "bw_balance_levels: "
+            f"black_q={color_transfer_bw_base_stats['black_level_q']:.4f}, "
+            f"white_q={color_transfer_bw_base_stats['white_level_q']:.4f}, "
+            f"gamma={color_transfer_bw_base_stats['gamma']:.4f}, "
+            f"median={color_transfer_bw_base_stats['median_before']:.4f}"
+            f"->{color_transfer_bw_base_stats['median_after']:.4f}"
+            if color_transfer_bw_base_stats is not None
+            else "bw_balance_levels: n/a"
+        ),
         f"color_opacity: {float(args.color_opacity):.3f}",
+        f"chroma_filter_radius: {int(args.chroma_filter_radius)}",
+        f"chroma_edge_preserve: {float(color_transfer_chroma_edge_preserve):.3f}",
+        f"low_conf_chroma_fill: {bool(color_transfer_low_conf_chroma_fill)}",
+        f"low_conf_chroma_fill_ratio: {float(color_transfer_low_conf_fill_ratio):.3f}",
+        f"low_conf_chroma_fill_donor_stage: {color_transfer_low_conf_fill_stage}",
+        f"chroma_boost: {float(args.chroma_boost):.3f}",
+        f"adaptive_chroma_match: {bool(args.adaptive_chroma_match)}",
+        f"adaptive_chroma_ratio: {float(color_transfer_adaptive_ratio):.3f}",
+        f"chroma_scale_applied: {float(color_transfer_chroma_scale_applied):.3f}",
         f"diag_max_side: {int(args.diag_max_side)}",
         f"filter_max_megapixels: {float(args.filter_max_megapixels):.2f}",
         f"save_dense_preds: {bool(args.save_dense_preds)}",
@@ -1898,6 +2812,11 @@ def main() -> int:
         f"prealign_confidence_quantile: {float(effective_prealign_conf_quantile):.3f}",
         f"prealign_border_trim_frac: {float(effective_prealign_border_trim_frac):.3f}",
         f"prealign_overlap_margin: {float(effective_prealign_overlap_margin):.4f}",
+        f"iterative_rematch_passes_requested: {int(effective_iterative_rematch_passes)}",
+        f"iterative_rematch_passes_run: {int(preprocessing['iterative_rematch_passes_run'])}",
+        f"iterative_rematch_passes_accepted: {int(preprocessing['iterative_rematch_passes_accepted'])}",
+        f"iterative_rematch_overlap_margin: {float(effective_iterative_rematch_overlap_margin):.4f}",
+        f"iterative_rematch_mae_margin: {float(effective_iterative_rematch_mae_margin):.4f}",
         f"metrics_computed_on: {diag_w}x{diag_h}",
         f"mae_before_src_resized_vs_ref: {mae_before:.6f}",
         f"mae_after_warped_vs_ref: {mae_warped:.6f}",
@@ -1946,6 +2865,17 @@ def main() -> int:
             f"overlap_delta={preprocessing['global_prealign_overlap_delta']}, "
             f"samples_used={preprocessing['global_prealign_samples_used']}, "
             f"border_trim_applied={bool(preprocessing['global_prealign_border_trim_applied'])}"
+        ),
+        (
+            "preprocessing_iterative_rematch: "
+            f"requested={int(preprocessing['iterative_rematch_requested_passes'])}, "
+            f"run={int(preprocessing['iterative_rematch_passes_run'])}, "
+            f"accepted={int(preprocessing['iterative_rematch_passes_accepted'])}, "
+            f"applied={bool(preprocessing['iterative_rematch_applied'])}, "
+            f"overlap_margin={float(preprocessing['iterative_rematch_overlap_margin']):.4f}, "
+            f"mae_margin={float(preprocessing['iterative_rematch_mae_margin']):.4f}, "
+            f"score_start={preprocessing['iterative_rematch_score_start']}, "
+            f"score_final={preprocessing['iterative_rematch_score_final']}"
         ),
         "",
         "pred fields:",
