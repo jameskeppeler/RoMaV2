@@ -42,6 +42,32 @@ def _compile_supported_for_device(dev: torch.device) -> tuple[bool, str | None]:
     return True, None
 
 
+def _load_roma_state_dict_local_first() -> OrderedDict[str, torch.Tensor]:
+    url = "https://github.com/Parskatt/RoMaV2/releases/download/weights/romav2.pt"
+    checkpoint_name = "romav2.pt"
+    local_checkpoint = Path(torch.hub.get_dir()) / "checkpoints" / checkpoint_name
+    if local_checkpoint.exists():
+        logger.info(f"Loading RoMa checkpoint from local cache: {local_checkpoint}")
+        try:
+            return torch.load(local_checkpoint, map_location="cpu", weights_only=True)
+        except TypeError:
+            # PyTorch versions before weights_only support.
+            return torch.load(local_checkpoint, map_location="cpu")
+        except Exception as exc:
+            logger.warning(
+                f"Local checkpoint load failed ({exc}). Falling back to URL download path."
+            )
+    else:
+        logger.info(
+            f"RoMa checkpoint not found in local cache ({local_checkpoint}); using URL loader."
+        )
+    return torch.hub.load_state_dict_from_url(
+        url,
+        map_location="cpu",
+        progress=False,
+    )
+
+
 def _interpolate_warp_and_confidence(
     *,
     warp: torch.Tensor,
@@ -108,9 +134,7 @@ class RoMaV2(nn.Module):
             # default
             cfg = RoMaV2.Cfg()
             
-        weights = torch.hub.load_state_dict_from_url(
-            "https://github.com/Parskatt/RoMaV2/releases/download/weights/romav2.pt"
-        )
+        weights = _load_roma_state_dict_local_first()
         self.f = Descriptor(cfg.descriptor)
         self.matcher = Matcher(cfg.matcher)
         self.cfg = cfg

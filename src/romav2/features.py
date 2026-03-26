@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 import torch
+from pathlib import Path
+import logging
 from einops import rearrange
 from romav2.normalizers import imagenet
 from romav2.types import Normalizer, DescriptorName
@@ -9,6 +11,44 @@ from torch import nn
 from functools import partial
 import torchvision.models as models
 from torch.nn import functional as F
+
+logger = logging.getLogger(__name__)
+
+
+def _torch_hub_cached_repo_path(repo_or_dir: str) -> Path | None:
+    """Resolve a torch.hub cached repo directory for a repo spec like owner/repo:ref."""
+    if ":" not in repo_or_dir:
+        return None
+    repo_name, ref = repo_or_dir.split(":", 1)
+    cache_dir_name = f"{repo_name.replace('/', '_')}_{ref.replace('/', '_')}"
+    candidate = Path(torch.hub.get_dir()) / cache_dir_name
+    if (candidate / "hubconf.py").exists():
+        return candidate
+    return None
+
+
+def _hub_load_local_first(*, repo_or_dir: str, model: str, **kwargs):
+    local_repo = _torch_hub_cached_repo_path(repo_or_dir)
+    if local_repo is not None:
+        try:
+            logger.info(f"Loading torch.hub model '{model}' from local cache: {local_repo}")
+            return torch.hub.load(
+                repo_or_dir=str(local_repo),
+                model=model,
+                source="local",
+                **kwargs,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"Local torch.hub load failed for '{model}' ({exc}). Falling back to '{repo_or_dir}'."
+            )
+    return torch.hub.load(
+        repo_or_dir=repo_or_dir,
+        model=model,
+        skip_validation=True,
+        verbose=False,
+        **kwargs,
+    )
 
 
 def wrap_with_normalize(
@@ -104,12 +144,11 @@ class Descriptor:
             case "dinov3_vitl16":
                 normalizer = imagenet
                 # TODO: this will break in distributed if not available locally
-                dinov3_vitl16: nn.Module = torch.hub.load(
+                dinov3_vitl16: nn.Module = _hub_load_local_first(
                     repo_or_dir="facebookresearch/dinov3:adc254450203739c8149213a7a69d8d905b4fcfa",
                     model="dinov3_vitl16",
                     pretrained=cfg.weights_path is not None,
                     weights=cfg.weights_path,
-                    skip_validation=True,
                 ).to(device)
                 layers = _get_layers(cfg.layer_idx, dinov3_vitl16)
                 return partial_wrap(

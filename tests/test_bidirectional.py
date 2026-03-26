@@ -5,9 +5,20 @@ import time
 from tqdm import tqdm
 from PIL import Image
 import numpy as np
+import os
+import pytest
+
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("ROMAV2_RUN_PERF_TESTS", "0") != "1",
+    reason="Performance benchmark disabled by default. Set ROMAV2_RUN_PERF_TESTS=1 to run.",
+)
 
 
 def test_unidirectional():
+    if not torch.cuda.is_available():
+        pytest.skip("Performance benchmark requires CUDA for stable timing thresholds.")
+
     model = RoMaV2()
     model.apply_setting("base")
     B = 8
@@ -47,6 +58,9 @@ def test_unidirectional():
     assert fps > 33, "FPS should be greater than 33"
 
 def test_bidirectional():
+    if not torch.cuda.is_available():
+        pytest.skip("Performance benchmark requires CUDA for stable timing thresholds.")
+
     model = RoMaV2()
     model.apply_setting("base")
     model.bidirectional = True

@@ -234,7 +234,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--border-crop-max-frac",
         type=float,
-        default=0.22,
+        default=0.12,
         help="Maximum fraction removable from each side during auto border crop.",
     )
     parser.add_argument(
@@ -744,14 +744,21 @@ def _normalize_bw_base_for_overlay(
     hi_q = float(np.clip(1.0 - white_clip, 0.51, 1.0))
     lo = float(np.quantile(gray, lo_q))
     hi = float(np.quantile(gray, hi_q))
-    span = max(hi - lo, 1e-6)
+
+    # Guard against excessive stretching.  If the image's tonal range is
+    # narrow (e.g. a dark scan where brightest pixel is only 60%), blind
+    # stretch-to-full-range would blow out highlights and crush shadows.
+    # Limit the effective endpoints so the stretch factor stays ≤ ~1.25x.
+    lo = min(lo, 0.10)   # never clip above 10% for black point
+    hi = max(hi, 0.80)   # never clip below 80% for white point
+    span = max(hi - lo, 0.50)
     leveled = np.clip((gray - lo) / span, 0.0, 1.0).astype(np.float32, copy=False)
 
     med_before = float(np.quantile(leveled, 0.5))
     target = float(np.clip(midtone_target, 0.05, 0.95))
     gamma = 1.0
     if 1e-4 < med_before < 0.9999:
-        gamma = float(np.clip(math.log(target) / math.log(med_before), 0.60, 1.80))
+        gamma = float(np.clip(math.log(target) / math.log(med_before), 0.90, 1.12))
         leveled = np.power(leveled, gamma).astype(np.float32, copy=False)
     med_after = float(np.quantile(leveled, 0.5))
 
@@ -960,12 +967,22 @@ def _scan_uniform_margin(
 def _auto_crop_border_like_margin(
     img: Image.Image,
     *,
-    max_crop_frac: float = 0.22,
+    max_crop_frac: float = 0.12,
 ) -> tuple[Image.Image, dict[str, int], bool]:
+    """Detect and remove thin uniform photo borders/frames.
+
+    Guards against mistaking uniform *backgrounds* (e.g. a studio grey
+    backdrop in a portrait) for borders:
+    - Per-side cap is max_crop_frac (default 12%).
+    - Total area removed must be < 30%.
+    - Aspect ratio change must be < 15%.
+    - At least 3 sides must have detectable border for the crop to fire.
+    """
     rgb = np.asarray(img.convert("RGB"), dtype=np.uint8)
     h, w, _ = rgb.shape
+    no_crop = (img, {"left": 0, "right": 0, "top": 0, "bottom": 0}, False)
     if h < 128 or w < 128:
-        return img, {"left": 0, "right": 0, "top": 0, "bottom": 0}, False
+        return no_crop
 
     luma = rgb.mean(axis=2).astype(np.float32)
     sat = (rgb.max(axis=2).astype(np.float32) - rgb.min(axis=2).astype(np.float32))
@@ -985,7 +1002,7 @@ def _auto_crop_border_like_margin(
 
     # Conservative guard: only attempt auto-crop when the edge appears mostly uniform.
     if rim_sat_median > 30.0 or rim_luma_std > 38.0:
-        return img, {"left": 0, "right": 0, "top": 0, "bottom": 0}, False
+        return no_crop
 
     luma_tol = max(16.0, 2.7 * rim_luma_mad)
     sat_limit = max(20.0, float(np.percentile(rim_sat, 85)) + 8.0)
@@ -998,10 +1015,10 @@ def _auto_crop_border_like_margin(
     rim_mask[:, -rim_x:] = True
     rim_border_frac = float(border_mask[rim_mask].mean())
     if rim_border_frac < 0.70:
-        return img, {"left": 0, "right": 0, "top": 0, "bottom": 0}, False
+        return no_crop
 
-    max_crop_x = max(0, int(round(w * max(0.0, min(0.45, max_crop_frac)))))
-    max_crop_y = max(0, int(round(h * max(0.0, min(0.45, max_crop_frac)))))
+    max_crop_x = max(0, int(round(w * max(0.0, min(0.30, max_crop_frac)))))
+    max_crop_y = max(0, int(round(h * max(0.0, min(0.30, max_crop_frac)))))
     left = _scan_uniform_margin(border_mask=border_mask, luma=luma, side="left", max_crop=max_crop_x)
     right = _scan_uniform_margin(border_mask=border_mask, luma=luma, side="right", max_crop=max_crop_x)
     top = _scan_uniform_margin(border_mask=border_mask, luma=luma, side="top", max_crop=max_crop_y)
@@ -1009,8 +1026,11 @@ def _auto_crop_border_like_margin(
 
     min_side_px = max(6, int(round(min(h, w) * 0.01)))
     sides = sum(int(v >= min_side_px) for v in (left, right, top, bottom))
-    if sides < 2:
-        return img, {"left": 0, "right": 0, "top": 0, "bottom": 0}, False
+    # Require at least 3 sides with a detectable border — a real photo frame
+    # has border on all sides, while uniform background typically only matches
+    # on 1-2 sides adjacent to the backdrop.
+    if sides < 3:
+        return no_crop
 
     x0 = int(left)
     y0 = int(top)
@@ -1018,10 +1038,23 @@ def _auto_crop_border_like_margin(
     y1 = int(max(y0 + 1, h - bottom))
     new_w = x1 - x0
     new_h = y1 - y0
-    if new_w < int(0.5 * w) or new_h < int(0.5 * h):
-        return img, {"left": 0, "right": 0, "top": 0, "bottom": 0}, False
+
+    # Reject if more than 30% of total area would be removed.
+    area_frac = (new_w * new_h) / max(1, w * h)
+    if area_frac < 0.70:
+        return no_crop
+
+    # Reject if cropping changes the aspect ratio by more than 15%.
+    orig_ar = w / max(1, h)
+    new_ar = new_w / max(1, new_h)
+    ar_change = abs(new_ar - orig_ar) / max(1e-6, orig_ar)
+    if ar_change > 0.15:
+        return no_crop
+
+    if new_w < int(0.55 * w) or new_h < int(0.55 * h):
+        return no_crop
     if (left + right + top + bottom) < min_side_px:
-        return img, {"left": 0, "right": 0, "top": 0, "bottom": 0}, False
+        return no_crop
 
     cropped = img.crop((x0, y0, x1, y1))
     return cropped, {"left": left, "right": right, "top": top, "bottom": bottom}, True
@@ -1423,8 +1456,8 @@ def main() -> int:
     if not (0.05 <= float(args.bw_midtone_target) <= 0.95):
         print("[ERROR] --bw-midtone-target must be in [0.05, 0.95].", file=sys.stderr)
         return 1
-    if not (0.0 <= float(args.border_crop_max_frac) <= 0.45):
-        print("[ERROR] --border-crop-max-frac must be in [0, 0.45].", file=sys.stderr)
+    if not (0.0 <= float(args.border_crop_max_frac) <= 0.30):
+        print("[ERROR] --border-crop-max-frac must be in [0, 0.30].", file=sys.stderr)
         return 1
     if not (0.0 <= float(args.min_global_inlier_ratio) <= 1.0):
         print("[ERROR] --min-global-inlier-ratio must be in [0, 1].", file=sys.stderr)
@@ -1510,6 +1543,7 @@ def main() -> int:
     ref_img = Image.open(args.ref).convert("RGB")
     src_img = Image.open(args.src).convert("RGB")
     ref_orig_w, ref_orig_h = ref_img.size
+    ref_orig_img = ref_img.copy()  # keep original for final output restoration
     src_orig_w, src_orig_h = src_img.size
     ref_match_path = args.ref
     src_match_path = args.src
@@ -1551,7 +1585,7 @@ def main() -> int:
     }
 
     if not args.disable_auto_border_crop:
-        max_crop_frac = float(max(0.0, min(0.45, args.border_crop_max_frac)))
+        max_crop_frac = float(max(0.0, min(0.30, args.border_crop_max_frac)))
         ref_cropped, ref_margins, ref_applied = _auto_crop_border_like_margin(
             ref_img,
             max_crop_frac=max_crop_frac,
@@ -2245,12 +2279,11 @@ def main() -> int:
         )
         warp_smooth_full = torch.from_numpy(warp_smooth_np).to(roma_device)
 
-        # Apply confidence mask ONCE: blend smoothed warp with the raw RoMa warp
-        # in low-confidence regions. Blending with identity caused visible
-        # double-exposure artifacts when src/ref geometry differs.
-        if confidence_mask is not None:
-            mask_2d = confidence_mask.unsqueeze(-1)
-            warp_smooth_full = mask_2d * warp_smooth_full + (1.0 - mask_2d) * warp_ab_full
+        # Do NOT blend the smooth warp field with the raw warp in low-confidence
+        # areas.  The guided filter should stay fully smooth everywhere;
+        # regularization (below) handles the fallback for low-confidence zones.
+        # Blending raw warp back here was re-introducing the very distortion
+        # artifacts the guided filter is meant to remove.
 
         # Keep sampling coordinates in the valid grid_sample range.
         warp_smooth_full = warp_smooth_full.clamp(-1.0, 1.0)
@@ -2323,6 +2356,7 @@ def main() -> int:
         torch.cuda.empty_cache()
 
     final_rgb: np.ndarray | None = None
+    final_rgb_cropped: np.ndarray | None = None
     in_bounds = warp_ab_full.abs().amax(dim=-1, keepdim=True).le(1.0).float()
     if overlap_full is not None:
         validity = overlap_full.unsqueeze(-1) * in_bounds
@@ -2365,7 +2399,12 @@ def main() -> int:
         else:
             fallback_img = warped_src
 
-        warped_regularized = alpha * warped_src + (1.0 - alpha) * fallback_img
+        # Use the guided-filter smoothed warp when available so we keep the
+        # edge-preserving denoising.  Previously this used the raw warp,
+        # which threw away all guided-filter work and left swirly distortion
+        # in low-confidence regions.
+        base_warp = warped_src_smooth if warped_src_smooth is not None else warped_src
+        warped_regularized = alpha * base_warp + (1.0 - alpha) * fallback_img
         warped_regularized_tensor = warped_regularized
         warped_regularized_rgb = _tensor_chw_to_uint8(warped_regularized)
         regularized_output_path = args.outdir / "warped_src_to_ref_regularized.png"
@@ -2436,6 +2475,11 @@ def main() -> int:
                 fill_rgb = _tensor_chw_to_uint8(warped_src)
                 fill_stage = "raw"
             fill_lab = _rgb_to_lab(fill_rgb)
+            # Pre-smooth fill chroma to prevent splotchy raw warp colors
+            # from bleeding into low-confidence areas (plain backgrounds).
+            fill_ab = fill_lab[..., 1:3].astype(np.float32, copy=True)
+            smooth_radius = max(int(args.chroma_filter_radius), 12)
+            fill_lab[..., 1:3] = _box_filter_2d(fill_ab, smooth_radius)
 
             if overlap_full is not None:
                 tau = float(args.regularize_overlap_thresh)
@@ -2486,6 +2530,17 @@ def main() -> int:
                 edge_weight = np.clip(edge_weight * edge_preserve_strength, 0.0, 1.0).astype(
                     np.float32, copy=False
                 )
+                # Suppress edge preservation in low-confidence areas where the
+                # raw warp is unreliable — using raw chroma there causes color
+                # splotching on plain backgrounds.
+                if overlap_full is not None:
+                    tau = float(args.regularize_overlap_thresh)
+                    denom = max(1e-6, 1.0 - tau)
+                    conf_np = np.clip(
+                        (overlap_full.detach().cpu().numpy() - tau) / denom,
+                        0.0, 1.0,
+                    ).astype(np.float32, copy=False)
+                    edge_weight = edge_weight * conf_np
                 donor_ab = donor_ab_smooth * (1.0 - edge_weight[..., None]) + donor_ab_raw * edge_weight[..., None]
                 print(
                     "[INFO] Chroma edge-preserve blend: "
@@ -2549,6 +2604,34 @@ def main() -> int:
             border_mask=border_mask,
         )
 
+        # Keep cropped-size version for diagnostics (which all work at ref_w x ref_h).
+        final_rgb_cropped = final_rgb
+
+        # If the ref image was auto-cropped, paste the colorized region back
+        # into the original-sized B&W image so the output matches the input.
+        # Normalize the full original first so its border tones match the
+        # color-blended centre (avoids sepia-vs-neutral seam at crop edge).
+        if preprocessing.get("ref_crop_applied"):
+            lrtb = preprocessing["ref_crop_margins_lrtb"]
+            left, right, top, bottom = lrtb[0], lrtb[1], lrtb[2], lrtb[3]
+            orig_rgb_raw = np.asarray(ref_orig_img.convert("RGB"), dtype=np.uint8)
+            if not args.disable_bw_gray_balance:
+                orig_rgb, _ = _normalize_bw_base_for_overlay(
+                    orig_rgb_raw,
+                    black_clip=float(args.bw_black_point_clip),
+                    white_clip=float(args.bw_white_point_clip),
+                    midtone_target=float(args.bw_midtone_target),
+                )
+            else:
+                orig_rgb = orig_rgb_raw.copy()
+            orig_rgb[top:ref_orig_h - bottom, left:ref_orig_w - right] = final_rgb
+            final_rgb = orig_rgb
+            print(
+                f"[INFO] Restored final output to original dimensions "
+                f"({ref_orig_w}x{ref_orig_h}), pasting colorized region at "
+                f"L{left} T{top} R{right} B{bottom}."
+            )
+
         final_colorized_path = args.outdir / "final_colorized.png"
         Image.fromarray(final_rgb).save(final_colorized_path)
         output_files.append(final_colorized_path)
@@ -2588,7 +2671,7 @@ def main() -> int:
     warped_diag = _diag_resize(warped_src_rgb)
     warped_smooth_diag = _diag_resize(warped_src_smooth_rgb) if warped_src_smooth_rgb is not None else None
     warped_regularized_diag = _diag_resize(warped_regularized_rgb) if warped_regularized_rgb is not None else None
-    final_diag = _diag_resize(final_rgb) if final_rgb is not None else None
+    final_diag = _diag_resize(final_rgb_cropped) if final_rgb_cropped is not None else None
 
     before_after_triptych = np.concatenate((ref_diag, src_diag, warped_diag), axis=1)
     before_after_triptych_path = args.outdir / "before_after_triptych.png"

@@ -39,6 +39,7 @@ try:
         QMainWindow,
         QMessageBox,
         QPlainTextEdit,
+        QProgressBar,
         QPushButton,
         QSizePolicy,
         QScrollArea,
@@ -96,193 +97,10 @@ Follow these steps in this exact order:
    - avoid oversaturation
 6. Preserve the original pose, expression, framing, composition and photographic realism.
 7. Output only the final restored color image.
-    - do NOT crop in the image or shrink in the edges of the photograph"""
+    - do NOT crop in the image or shrink in the edges of the photograph
+    - DISPLAY the final image directly in the chat as an embedded image
+    - do NOT provide a text download link instead of showing the image"""
 
-
-TEST_PROMPT_GEOSTRICT = """Restore and colorize this historical photo.
-
-Hard geometry constraints (must follow exactly):
-1. Preserve exact pixel dimensions of the input image.
-2. Do not crop, reframe, rotate, skew, perspective-warp, stretch, or resize.
-3. Do not outpaint or add any new border area.
-4. Keep all objects and edges in the same positions as the original.
-
-Restoration constraints:
-1. Remove damage, haze, scratches, and stains while preserving original identity and structure.
-2. Keep a natural, period-appropriate color palette with realistic skin and clothing tones.
-3. Avoid plastic skin and avoid hallucinated details.
-
-Output only one final restored color image with identical dimensions to the input."""
-
-TEST_PROMPT_BALANCED = """Restore this old photograph in one continuous edit and produce a single final image.
-
-Required geometry:
-1. Keep exact original framing and exact pixel dimensions.
-2. Do not crop, rotate, recompose, or resize.
-3. No outpainting outside the original image bounds.
-
-Quality goals:
-1. Recover detail and reduce age damage while preserving true identity and scene structure.
-2. Neutralize yellow/brown cast before colorization.
-3. Apply vivid but historically plausible natural color.
-
-Output only one final restored color image at the same dimensions as input."""
-
-TEST_PROMPT_DETAIL = """Colorize and restore this photo with high facial and texture fidelity.
-
-Mandatory geometry lock:
-1. Keep exact width and height of the input.
-2. No crop, no resize, no rotation, no reframing, no outpainting.
-3. Preserve exact scene composition and edge alignment.
-
-Restoration priorities:
-1. Maximize facial feature fidelity and garment texture clarity.
-2. Remove blur and damage without introducing synthetic artifacts.
-3. Use realistic historical colors with clearly visible, natural chroma (not muted).
-
-Output one final image only, same dimensions as input."""
-
-TEST_PROMPT_COLORSAFE = """Restore and colorize this historical image with conservative, natural color.
-
-Hard constraints:
-1. Preserve exact input geometry and dimensions.
-2. Do not crop, resize, rotate, outpaint, or reframe.
-3. Keep every object in its original location.
-
-Color constraints:
-1. Prioritize natural, plausible, low-risk color choices.
-2. Keep color believable but not washed out; avoid bleeding across edges.
-3. Keep skin, hair, clothing, and background believable for period context.
-
-Output one final restored color image only, with the same dimensions as input."""
-
-
-TEST_PRESETS = [
-    {
-        "id": "A_GeoStrict",
-        "button_label": "Test A - Geo Strict",
-        "description": "Strong geometry lock, high pre-align confidence, reference fallback.",
-        "prompt": TEST_PROMPT_GEOSTRICT,
-        "setting": "precise",
-        "accuracy_mode": True,
-        "c1_adherence": "Extreme",
-        "color_opacity": 0.98,
-        "advanced": {
-            "gf_radius": 14,
-            "gf_eps": 0.0006,
-            "chroma_radius": 22,
-            "chroma_boost": 1.22,
-            "chroma_edge_preserve": 0.90,
-            "bw_gray_balance": True,
-            "bw_black_clip": 0.010,
-            "bw_white_clip": 0.010,
-            "bw_midtone_target": 0.55,
-            "adaptive_chroma": True,
-            "reg_thresh": 0.40,
-            "reg_fallback": "reference",
-            "num_samples": 8000,
-            "max_draw": 1200,
-        },
-        "extra_flags": [
-            "--disable-auto-border-crop",
-            "--min-overlap-mean", "0.06",
-            "--allow-low-overlap",
-            "--auto-reference-fallback-overlap", "0.24",
-        ],
-    },
-    {
-        "id": "B_RobustMega",
-        "button_label": "Test B - Robust Mega",
-        "description": "Max robustness with mega1500 and deeper rematch.",
-        "prompt": TEST_PROMPT_BALANCED,
-        "setting": "mega1500",
-        "accuracy_mode": True,
-        "c1_adherence": "Extreme",
-        "color_opacity": 0.98,
-        "advanced": {
-            "gf_radius": 16,
-            "gf_eps": 0.0005,
-            "chroma_radius": 26,
-            "chroma_boost": 1.28,
-            "chroma_edge_preserve": 0.88,
-            "bw_gray_balance": True,
-            "bw_black_clip": 0.010,
-            "bw_white_clip": 0.010,
-            "bw_midtone_target": 0.55,
-            "adaptive_chroma": True,
-            "reg_thresh": 0.36,
-            "reg_fallback": "reference",
-            "num_samples": 10000,
-            "max_draw": 1600,
-        },
-        "extra_flags": [
-            "--min-overlap-mean", "0.06",
-            "--allow-low-overlap",
-            "--auto-reference-fallback-overlap", "0.22",
-        ],
-    },
-    {
-        "id": "C_DetailLock",
-        "button_label": "Test C - Detail Lock",
-        "description": "Sharper local warp with tighter confidence filtering.",
-        "prompt": TEST_PROMPT_DETAIL,
-        "setting": "precise",
-        "accuracy_mode": True,
-        "c1_adherence": "Extreme",
-        "color_opacity": 1.0,
-        "advanced": {
-            "gf_radius": 10,
-            "gf_eps": 0.0004,
-            "chroma_radius": 18,
-            "chroma_boost": 1.18,
-            "chroma_edge_preserve": 0.94,
-            "bw_gray_balance": True,
-            "bw_black_clip": 0.010,
-            "bw_white_clip": 0.010,
-            "bw_midtone_target": 0.55,
-            "adaptive_chroma": True,
-            "reg_thresh": 0.33,
-            "reg_fallback": "identity",
-            "num_samples": 9000,
-            "max_draw": 1200,
-        },
-        "extra_flags": [
-            "--min-overlap-mean", "0.07",
-            "--allow-low-overlap",
-        ],
-    },
-    {
-        "id": "D_ColorSafe",
-        "button_label": "Test D - Color Safe",
-        "description": "Conservative color transfer with strong geometry consistency.",
-        "prompt": TEST_PROMPT_COLORSAFE,
-        "setting": "precise",
-        "accuracy_mode": True,
-        "c1_adherence": "Extreme",
-        "color_opacity": 0.95,
-        "advanced": {
-            "gf_radius": 18,
-            "gf_eps": 0.0007,
-            "chroma_radius": 20,
-            "chroma_boost": 1.12,
-            "chroma_edge_preserve": 0.92,
-            "bw_gray_balance": True,
-            "bw_black_clip": 0.010,
-            "bw_white_clip": 0.010,
-            "bw_midtone_target": 0.55,
-            "adaptive_chroma": True,
-            "reg_thresh": 0.42,
-            "reg_fallback": "reference",
-            "num_samples": 7000,
-            "max_draw": 1000,
-        },
-        "extra_flags": [
-            "--min-overlap-mean", "0.06",
-            "--allow-low-overlap",
-            "--auto-reference-fallback-overlap", "0.20",
-        ],
-    },
-]
 
 class AutoUploadWebPage(QWebEnginePage):
     """QWebEnginePage that can auto-answer file dialogs with a pending file path."""
@@ -432,217 +250,221 @@ class FullscreenImageDialog(QDialog):
 
 
 class ShimmerWidget(QWidget):
-    """Dense glitter shimmer effect over a blurred C1 image.
+    """Shimmer effect over a blurred C1 image.
 
-    Shows a heavily blurred version of the C1 (ChatGPT-generated color) image
-    with thousands of animated sparkle/glitter particles — similar to the
-    Google Photos AI-enhance shimmer effect.
+    Before a C1 image is available: shows cheeky rotating loading messages with
+    morphing color blobs and shimmering dots on a dark background.
+
+    After C1 arrives: the blurred C1 image fades in slowly under the dots/morph,
+    all effects are clipped to the image rectangle (letterbox areas stay dark).
     """
 
-    # Particle counts by layer for dense coverage
-    _LAYER_COUNTS = (1200, 800, 500)  # fine, medium, bright = 2500 total
+    _DOT_COUNT = 2000
+    _LOADING_MESSAGES = [
+        "Fetching paints",
+        "Finding a time machine",
+        "Picking a color palette",
+        "Consulting the color oracle",
+        "Mixing the perfect hue",
+        "Dusting off the crayons",
+        "Rewinding the clock",
+        "Asking nicely for pigments",
+        "Calibrating the rainbow",
+        "Traveling to the past",
+        "Selecting vintage tones",
+        "Warming up the brush",
+    ]
+
+    # Text fade timing constants (seconds)
+    _MSG_FADE_DUR = 0.75   # fade in/out duration
+    _MSG_LINGER = 4.5      # time at full opacity
+    _MSG_CYCLE = _MSG_LINGER + 2 * _MSG_FADE_DUR  # total cycle ~6s
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._source_pixmap: QPixmap | None = None
         self._blurred: QPixmap | None = None
+        self._blurred_size: tuple[int, int] = (0, 0)
+        self._img_rect: QRect = QRect()  # image bounds within widget
         self._phase: float = 0.0
-        self._layers: list[list[dict]] = [[], [], []]
+        self._fade_in: float = 0.0  # 0→1 fade for C1 image appearance
+        self._dots: list[dict] = []
+        self._msg_index: int = 0
+        self._msg_timer: float = 0.0
+        self._msg_opacity: float = 0.0  # text fade opacity
         self._timer = QTimer(self)
-        self._timer.setInterval(40)  # 25 fps
+        self._timer.setInterval(50)  # 20 fps — slower
         self._timer.timeout.connect(self._tick)
 
     def set_source(self, pixmap: QPixmap | None) -> None:
+        was_none = self._source_pixmap is None or (self._source_pixmap and self._source_pixmap.isNull())
         self._source_pixmap = pixmap
         self._blurred = None
+        self._blurred_size = (0, 0)
+        if pixmap and not pixmap.isNull() and was_none:
+            self._fade_in = 0.0  # start fade-in from zero
         if pixmap and not pixmap.isNull():
-            self._regenerate_sparkles()
+            self._regenerate_dots()
         self.update()
 
     def start(self) -> None:
         self._phase = 0.0
-        self._regenerate_sparkles()
+        self._fade_in = 0.0
+        self._msg_index = random.randint(0, len(self._LOADING_MESSAGES) - 1)
+        self._msg_timer = 0.0
+        self._regenerate_dots()
         self._timer.start()
 
     def stop(self) -> None:
         self._timer.stop()
 
-    def _regenerate_sparkles(self) -> None:
-        palette_fine = ["#ffffff", "#ffe8c0", "#c8e0ff", "#ffe0d0", "#e0d0ff",
-                        "#d0ffe0", "#fff0b0", "#b0e8ff"]
-        palette_med = ["#ffffff", "#ffd080", "#80c0ff", "#ffa0c0", "#c0a0ff",
-                       "#a0ffc0", "#ffe070"]
-        palette_bright = ["#ffffff", "#fffbe0", "#e0f0ff"]
-        self._layers = []
-        # Layer 0: fine dust — tiny, fast twinkle
-        fine = []
-        for _ in range(self._LAYER_COUNTS[0]):
-            fine.append({
-                "x": random.random(), "y": random.random(),
-                "size": random.uniform(0.6, 1.8),
-                "speed": random.uniform(1.5, 4.0),
-                "phase": random.uniform(0, 2 * math.pi),
-                "color": random.choice(palette_fine),
-                "drift_x": random.uniform(-0.002, 0.002),
-                "drift_y": random.uniform(-0.002, 0.002),
-            })
-        self._layers.append(fine)
-        # Layer 1: medium sparkles — cross-shaped
-        med = []
-        for _ in range(self._LAYER_COUNTS[1]):
-            med.append({
-                "x": random.random(), "y": random.random(),
-                "size": random.uniform(1.8, 3.5),
+    def _regenerate_dots(self) -> None:
+        self._dots = []
+        for _ in range(self._DOT_COUNT):
+            self._dots.append({
+                "x": random.random(),
+                "y": random.random(),
+                "size": random.uniform(0.5, 1.5),
                 "speed": random.uniform(0.8, 2.5),
                 "phase": random.uniform(0, 2 * math.pi),
-                "color": random.choice(palette_med),
-                "drift_x": random.uniform(-0.001, 0.001),
-                "drift_y": random.uniform(-0.001, 0.001),
             })
-        self._layers.append(med)
-        # Layer 2: bright star bursts — large, slow, rare peak
-        bright = []
-        for _ in range(self._LAYER_COUNTS[2]):
-            bright.append({
-                "x": random.random(), "y": random.random(),
-                "size": random.uniform(3.0, 6.0),
-                "speed": random.uniform(0.3, 1.0),
-                "phase": random.uniform(0, 2 * math.pi),
-                "color": random.choice(palette_bright),
-                "drift_x": random.uniform(-0.0005, 0.0005),
-                "drift_y": random.uniform(-0.0005, 0.0005),
-            })
-        self._layers.append(bright)
 
     def _tick(self) -> None:
-        self._phase += 0.10
-        # Drift particles slowly
-        for layer in self._layers:
-            for sp in layer:
-                sp["x"] = (sp["x"] + sp["drift_x"]) % 1.0
-                sp["y"] = (sp["y"] + sp["drift_y"]) % 1.0
+        self._phase += 0.06  # slower overall
+        # Rotate loading message with fade in/out transition
+        self._msg_timer += 0.05
+        if self._msg_timer >= self._MSG_CYCLE:
+            self._msg_timer = 0.0
+            self._msg_index = (self._msg_index + 1) % len(self._LOADING_MESSAGES)
+        # Compute text opacity: fade-in → linger → fade-out
+        if self._msg_timer < self._MSG_FADE_DUR:
+            self._msg_opacity = self._msg_timer / self._MSG_FADE_DUR
+        elif self._msg_timer < self._MSG_FADE_DUR + self._MSG_LINGER:
+            self._msg_opacity = 1.0
+        else:
+            self._msg_opacity = 1.0 - (self._msg_timer - self._MSG_FADE_DUR - self._MSG_LINGER) / self._MSG_FADE_DUR
+        self._msg_opacity = max(0.0, min(1.0, self._msg_opacity))
+        # Slow fade-in when C1 image is present
+        has_source = self._source_pixmap is not None and not self._source_pixmap.isNull()
+        if has_source and self._fade_in < 1.0:
+            self._fade_in = min(1.0, self._fade_in + 0.008)  # ~6 seconds to fully appear
         self.update()
+
+    def _compute_img_rect(self, w: int, h: int) -> QRect:
+        """Compute the aspect-correct image rectangle within the widget."""
+        src = self._source_pixmap
+        if src and not src.isNull():
+            scale = min(w / src.width(), h / src.height())
+            img_w = int(src.width() * scale)
+            img_h = int(src.height() * scale)
+        else:
+            img_w, img_h = w, h
+        x0 = (w - img_w) // 2
+        y0 = (h - img_h) // 2
+        return QRect(x0, y0, img_w, img_h)
+
+    def _build_blurred(self, img_rect: QRect) -> QPixmap:
+        """Build a heavily blurred pixmap using multi-pass progressive downscale.
+
+        Instead of one extreme 1/28 shrink (which creates blocky pixels),
+        we halve the image 4 times, then scale back up. Each SmoothTransformation
+        pass acts as a low-pass filter, producing a smooth Gaussian-like blur.
+        """
+        src = self._source_pixmap
+        iw, ih = img_rect.width(), img_rect.height()
+        pix = src.scaled(iw, ih, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        # Progressive downscale — 4 halvings ≈ 1/16 each dimension
+        for _ in range(4):
+            pw = max(1, pix.width() // 2)
+            ph = max(1, pix.height() // 2)
+            pix = pix.scaled(pw, ph, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        # Progressive upscale — double back up in steps for smooth interpolation
+        fw, fh = img_rect.width(), img_rect.height()
+        # Scale to fitted dimensions via the source aspect ratio
+        fitted_src = src.scaled(iw, ih, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        fw, fh = fitted_src.width(), fitted_src.height()
+        while pix.width() < fw // 2 and pix.height() < fh // 2:
+            pix = pix.scaled(
+                min(fw, pix.width() * 2), min(fh, pix.height() * 2),
+                Qt.IgnoreAspectRatio, Qt.SmoothTransformation,
+            )
+        return pix.scaled(fw, fh, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
 
-        # Draw blurred C1 source or dark background
-        if self._source_pixmap and not self._source_pixmap.isNull():
-            if self._blurred is None or self._blurred.size() != self.size():
-                # Heavy blur: scale way down then back up
-                tiny = self._source_pixmap.scaled(
-                    max(1, w // 16), max(1, h // 16),
-                    Qt.IgnoreAspectRatio, Qt.SmoothTransformation,
-                )
-                self._blurred = tiny.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-            painter.drawPixmap(0, 0, self._blurred)
-            # Slight dim overlay so sparkles pop
-            painter.fillRect(0, 0, w, h, QColor(0, 0, 0, 40))
-        else:
-            painter.fillRect(0, 0, w, h, QColor("#181818"))
+        # Dark background for the whole widget
+        painter.fillRect(0, 0, w, h, QColor("#111"))
 
-        # Sweeping color wash — two overlapping radial gradients
-        for i, (freq_x, freq_y, hue_off, alpha_base) in enumerate([
-            (0.5, 0.3, 0, 0.18), (0.7, 0.6, 160, 0.12),
-        ]):
-            cx = w * (0.5 + 0.3 * math.sin(self._phase * freq_x + i))
-            cy = h * (0.5 + 0.3 * math.cos(self._phase * freq_y + i * 2))
-            radius = max(w, h) * 0.8
+        # Compute image bounds
+        ir = self._compute_img_rect(w, h)
+        self._img_rect = ir
+
+        has_source = self._source_pixmap is not None and not self._source_pixmap.isNull()
+
+        # Clip all effects to the image rectangle
+        painter.setClipRect(ir)
+
+        if has_source:
+            # Build/cache blurred image
+            cache_key = (ir.width(), ir.height())
+            if self._blurred is None or self._blurred_size != cache_key:
+                self._blurred = self._build_blurred(ir)
+                self._blurred_size = cache_key
+            # Draw blurred C1 with fade-in opacity
+            painter.setOpacity(self._fade_in)
+            painter.drawPixmap(ir.x(), ir.y(), self._blurred)
+            painter.setOpacity(1.0)
+
+        # Animated morph blobs (clipped to image rect) — stay consistent
+        # regardless of whether the C1 source image has arrived.
+        for i in range(3):
+            cx = ir.x() + ir.width() * (0.5 + 0.25 * math.sin(self._phase * 0.2 + i * 2.1))
+            cy = ir.y() + ir.height() * (0.5 + 0.25 * math.cos(self._phase * 0.15 + i * 1.7))
+            radius = max(ir.width(), ir.height()) * (0.35 + 0.1 * math.sin(self._phase * 0.1 + i))
             grad = QRadialGradient(cx, cy, radius)
-            hue = ((self._phase * 12) + hue_off) % 360
-            c1 = QColor.fromHsvF(hue / 360.0, 0.35, 0.7, alpha_base)
-            c2 = QColor.fromHsvF(((hue + 90) % 360) / 360.0, 0.25, 0.5, alpha_base * 0.5)
+            base_alpha = 0.08 + 0.04 * math.sin(self._phase * 0.12 + i * 3.0)
+            hue = (i * 120 + self._phase * 3) % 360
+            c1 = QColor.fromHsvF(hue / 360.0, 0.3, 0.6, base_alpha)
             grad.setColorAt(0.0, c1)
-            grad.setColorAt(0.6, c2)
             grad.setColorAt(1.0, QColor(0, 0, 0, 0))
-            painter.fillRect(0, 0, w, h, grad)
+            painter.fillRect(ir, grad)
 
-        # Layer 0: fine dust particles (dots only)
+        # Tiny white shimmering dots (only within image rect)
         painter.setPen(Qt.NoPen)
-        for sp in self._layers[0]:
-            raw_a = 0.5 + 0.5 * math.sin(self._phase * sp["speed"] + sp["phase"])
-            if raw_a < 0.2:
-                continue
-            alpha = raw_a * 0.75
-            sx, sy = sp["x"] * w, sp["y"] * h
-            sz = sp["size"] * (0.5 + 0.5 * raw_a)
-            color = QColor(sp["color"])
-            color.setAlphaF(min(1.0, alpha))
-            painter.setBrush(color)
-            painter.drawEllipse(int(sx - sz), int(sy - sz), int(sz * 2), int(sz * 2))
-
-        # Layer 1: medium cross sparkles
-        for sp in self._layers[1]:
-            raw_a = 0.5 + 0.5 * math.sin(self._phase * sp["speed"] + sp["phase"])
+        white = QColor("#ffffff")
+        for dot in self._dots:
+            raw_a = 0.5 + 0.5 * math.sin(self._phase * dot["speed"] + dot["phase"])
             if raw_a < 0.25:
                 continue
-            alpha = raw_a * 0.85
-            sx, sy = sp["x"] * w, sp["y"] * h
-            sz = sp["size"] * (0.6 + 0.4 * raw_a)
-            color = QColor(sp["color"])
-            color.setAlphaF(min(1.0, alpha))
-            # Dot
-            painter.setBrush(color)
-            painter.setPen(Qt.NoPen)
-            painter.drawEllipse(int(sx - sz * 0.7), int(sy - sz * 0.7), int(sz * 1.4), int(sz * 1.4))
-            # Cross arms
-            if raw_a > 0.4:
-                pen = QPen(color)
-                pen.setWidthF(0.6)
-                painter.setPen(pen)
-                arm = sz * 2.0
-                painter.drawLine(int(sx - arm), int(sy), int(sx + arm), int(sy))
-                painter.drawLine(int(sx), int(sy - arm), int(sx), int(sy + arm))
+            alpha = raw_a * 0.65
+            sx = ir.x() + dot["x"] * ir.width()
+            sy = ir.y() + dot["y"] * ir.height()
+            sz = dot["size"] * (0.5 + 0.5 * raw_a)
+            white.setAlphaF(min(1.0, alpha))
+            painter.setBrush(white)
+            painter.drawEllipse(int(sx - sz), int(sy - sz), int(sz * 2), int(sz * 2))
 
-        # Layer 2: bright star bursts (4-point star + glow)
-        for sp in self._layers[2]:
-            raw_a = 0.5 + 0.5 * math.sin(self._phase * sp["speed"] + sp["phase"])
-            if raw_a < 0.55:
-                continue
-            alpha = (raw_a - 0.3) * 1.2
-            sx, sy = sp["x"] * w, sp["y"] * h
-            sz = sp["size"] * (0.5 + 0.5 * raw_a)
-            # Glow halo
-            glow_color = QColor(sp["color"])
-            glow_color.setAlphaF(min(1.0, alpha * 0.3))
-            painter.setBrush(glow_color)
-            painter.setPen(Qt.NoPen)
-            glow_r = sz * 3.0
-            painter.drawEllipse(int(sx - glow_r), int(sy - glow_r), int(glow_r * 2), int(glow_r * 2))
-            # Core dot
-            core_color = QColor("#ffffff")
-            core_color.setAlphaF(min(1.0, alpha * 0.9))
-            painter.setBrush(core_color)
-            painter.drawEllipse(int(sx - sz * 0.6), int(sy - sz * 0.6), int(sz * 1.2), int(sz * 1.2))
-            # 4-point star arms
-            pen = QPen(core_color)
-            pen.setWidthF(max(0.5, sz * 0.2))
-            painter.setPen(pen)
-            arm = sz * 3.5
-            short_arm = sz * 2.0
-            painter.drawLine(int(sx - arm), int(sy), int(sx + arm), int(sy))
-            painter.drawLine(int(sx), int(sy - arm), int(sx), int(sy + arm))
-            # Diagonal arms (shorter)
-            diag = short_arm * 0.707
-            painter.drawLine(int(sx - diag), int(sy - diag), int(sx + diag), int(sy + diag))
-            painter.drawLine(int(sx + diag), int(sy - diag), int(sx - diag), int(sy + diag))
+        painter.setClipping(False)
 
-        # "Generating color..." text with shadow
+        # Loading text centered on image rect — persistent style throughout
         font = painter.font()
-        font.setPointSize(13)
+        font.setPointSize(12)
         font.setBold(True)
         painter.setFont(font)
-        dots = "." * (1 + int(self._phase) % 3)
-        text = f"Generating color{dots}"
-        # Shadow
-        painter.setPen(QColor(0, 0, 0, 120))
-        shadow_rect = self.rect().adjusted(2, 2, 2, 2)
-        painter.drawText(shadow_rect, Qt.AlignCenter, text)
-        # Main text
-        painter.setPen(QColor(255, 255, 255, 210))
-        painter.drawText(self.rect(), Qt.AlignCenter, text)
+        msg = self._LOADING_MESSAGES[self._msg_index]
+        dots_text = "." * (1 + int(self._phase * 0.8) % 3)
+        text = f"{msg}{dots_text}"
+        text_alpha = int(210 * self._msg_opacity)
+        if text_alpha > 2:
+            # Shadow
+            painter.setPen(QColor(0, 0, 0, int(140 * self._msg_opacity)))
+            painter.drawText(ir.adjusted(2, 2, 2, 2), Qt.AlignCenter, text)
+            # Main text
+            painter.setPen(QColor(255, 255, 255, text_alpha))
+            painter.drawText(ir, Qt.AlignCenter, text)
 
         painter.end()
 
@@ -673,8 +495,8 @@ class BeforeAfterSlider(QWidget):
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
         w, h = self.width(), self.height()
 
-        # Scale both images to fit the widget while preserving aspect ratio
-        # Use the after image dimensions as reference
+        # Scale both images to fit the widget while preserving aspect ratio.
+        # Use the after image's native aspect ratio as the reference.
         ref = self._after
         scale = min(w / ref.width(), h / ref.height())
         img_w = int(ref.width() * scale)
@@ -682,17 +504,27 @@ class BeforeAfterSlider(QWidget):
         x0 = (w - img_w) // 2
         y0 = (h - img_h) // 2
 
+        # Dark fill behind letterbox areas
+        painter.fillRect(0, 0, w, h, QColor("#111"))
+
         split_x = x0 + int(img_w * self._split)
 
+        # Scale both preserving aspect ratio (match to the after image dimensions)
+        before_scaled = self._before.scaled(img_w, img_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        after_scaled = self._after.scaled(img_w, img_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        # Center each within the img rect (handles slight size diffs)
+        bx = x0 + (img_w - before_scaled.width()) // 2
+        by = y0 + (img_h - before_scaled.height()) // 2
+        ax = x0 + (img_w - after_scaled.width()) // 2
+        ay = y0 + (img_h - after_scaled.height()) // 2
+
         # Draw "before" (left side)
-        before_scaled = self._before.scaled(img_w, img_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
         painter.setClipRect(x0, y0, split_x - x0, img_h)
-        painter.drawPixmap(x0, y0, before_scaled)
+        painter.drawPixmap(bx, by, before_scaled)
 
         # Draw "after" (right side)
-        after_scaled = self._after.scaled(img_w, img_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
         painter.setClipRect(split_x, y0, x0 + img_w - split_x, img_h)
-        painter.drawPixmap(x0, y0, after_scaled)
+        painter.drawPixmap(ax, ay, after_scaled)
 
         # Divider line
         painter.setClipping(False)
@@ -797,6 +629,9 @@ class PhotoColorizerQt(QMainWindow):
         self._full_workflow_active = False
         self._full_workflow_waiting_for_c1 = False
         self._full_workflow_pending_delete = False
+        self._c1_image_nudge_sent = False
+        self._c1_workflow_retry_count = 0
+        self._c1_prompt_sent_monotonic: float | None = None  # when C1 prompt was sent
         self._delete_target_conv_id: str | None = None
         self._run_started_monotonic: float | None = None
         self._last_process_output_monotonic: float | None = None
@@ -809,6 +644,7 @@ class PhotoColorizerQt(QMainWindow):
         self._c1_preview_pixmap: QPixmap | None = None
         self._last_run_outdir: Path | None = None
         self._last_download_result_path: Path | None = None
+        self._result_saved: bool = True  # True means no unsaved result
         self._fullscreen_dialog: FullscreenImageDialog | None = None
         self._chat_expanded_width = 500
         self._active_test_preset_id: str | None = None
@@ -1184,13 +1020,19 @@ class PhotoColorizerQt(QMainWindow):
         result_layout.addWidget(self.result_stack, 1)
 
         result_buttons = QHBoxLayout()
-        self.open_result_btn = QPushButton("Open Image Location")
-        self.open_result_btn.clicked.connect(self._open_selected_preview_location)
+        self.save_result_btn = QPushButton("Save Result")
+        self.save_result_btn.setStyleSheet(
+            "QPushButton { background: #2e7d32; color: white; font-weight: bold; padding: 6px 16px; }"
+            "QPushButton:hover { background: #388e3c; }"
+            "QPushButton:disabled { background: #444; color: #777; }"
+        )
+        self.save_result_btn.clicked.connect(self._save_result_dialog)
+        self.save_result_btn.setEnabled(False)
+        result_buttons.addWidget(self.save_result_btn)
+        self.open_result_btn = QPushButton("Open Output Folder")
+        self.open_result_btn.clicked.connect(self._open_output_folder)
         self.open_result_btn.setEnabled(False)
         result_buttons.addWidget(self.open_result_btn)
-        open_outdir_btn = QPushButton("Open Output Folder")
-        open_outdir_btn.clicked.connect(self._open_output_folder)
-        result_buttons.addWidget(open_outdir_btn)
         result_buttons.addStretch(1)
         result_layout.addLayout(result_buttons)
 
@@ -1226,8 +1068,6 @@ class PhotoColorizerQt(QMainWindow):
         sidebar_layout.addWidget(self._build_progress_group())
         # 6. Log
         sidebar_layout.addWidget(self._build_log_group())
-        # 7. Test presets (dev)
-        sidebar_layout.addWidget(self._build_test_presets_group())
         sidebar_layout.addStretch(1)
 
         scroll.setWidget(container)
@@ -1338,39 +1178,6 @@ class PhotoColorizerQt(QMainWindow):
             expanded = bool(sizes and sizes[0] > 10)
         self._set_browser_panel_visible(not expanded)
 
-    def _build_test_presets_group(self) -> QGroupBox:
-        group = QGroupBox("Test Presets")
-        layout = QVBoxLayout(group)
-        layout.setContentsMargins(6, 10, 6, 6)
-        layout.setSpacing(4)
-        self.test_presets_layout = layout
-
-        hint = QLabel("Apply preset prompt + accuracy profile, then run workflow.")
-        hint.setObjectName("formHint")
-        hint.setWordWrap(True)
-        self.test_presets_hint_label = hint
-        layout.addWidget(hint)
-
-        self.test_preset_use_prompt_check = QCheckBox("Use preset prompt text")
-        self.test_preset_use_prompt_check.setChecked(False)
-        self.test_preset_use_prompt_check.setToolTip(
-            "Off: keep your edited prompt.\nOn: replace with preset's built-in prompt."
-        )
-        layout.addWidget(self.test_preset_use_prompt_check)
-
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(6)
-        grid.setVerticalSpacing(4)
-        for idx, preset in enumerate(TEST_PRESETS):
-            btn = QPushButton(str(preset.get("button_label", preset.get("id", f"Test {idx+1}"))))
-            btn.clicked.connect(lambda _checked=False, pid=str(preset.get("id", "")): self._run_test_preset(pid))
-            btn.setToolTip(str(preset.get("description", "")))
-            row = idx // 2
-            col = idx % 2
-            grid.addWidget(btn, row, col)
-        layout.addLayout(grid)
-        return group
-
     def _build_status_log_row(self) -> QWidget:
         # Kept for compat - no longer used in the two-column layout but may be
         # referenced by hasattr checks in responsive code.
@@ -1398,26 +1205,64 @@ class PhotoColorizerQt(QMainWindow):
     # _build_preview_group and _build_run_controls_group removed —
     # their widgets are now created in _build_preview_column and _build_action_group.
 
-    def _build_log_group(self) -> QGroupBox:
-        group = QGroupBox("Log")
-        layout = QVBoxLayout(group)
-        layout.setContentsMargins(6, 10, 6, 6)
-        layout.setSpacing(4)
+    def _build_log_group(self) -> QWidget:
+        wrapper = QWidget()
+        outer = QVBoxLayout(wrapper)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Collapsible header button
+        self._log_toggle_btn = QPushButton("Log  \u25b6")  # right arrow = collapsed
+        self._log_toggle_btn.setCheckable(True)
+        self._log_toggle_btn.setChecked(False)
+        self._log_toggle_btn.setStyleSheet(
+            "QPushButton { text-align: left; padding: 4px 8px; font-weight: bold; }"
+        )
+        self._log_toggle_btn.toggled.connect(self._toggle_log_visibility)
+        outer.addWidget(self._log_toggle_btn)
+
+        # Collapsible content
+        self._log_content = QWidget()
+        content_layout = QVBoxLayout(self._log_content)
+        content_layout.setContentsMargins(6, 4, 6, 6)
+        content_layout.setSpacing(4)
 
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setPlaceholderText("Pipeline logs will appear here.")
         self.log_box.setMinimumHeight(100)
         self.log_box.setMaximumHeight(220)
-        layout.addWidget(self.log_box, 1)
+        content_layout.addWidget(self.log_box, 1)
 
         action_row = QHBoxLayout()
         clear_log_btn = QPushButton("Clear")
         clear_log_btn.clicked.connect(self.log_box.clear)
         action_row.addWidget(clear_log_btn)
         action_row.addStretch(1)
-        layout.addLayout(action_row)
-        return group
+        content_layout.addLayout(action_row)
+
+        # Default collapsed
+        self._log_content.setVisible(False)
+        outer.addWidget(self._log_content)
+        return wrapper
+
+    def _toggle_log_visibility(self, expanded: bool) -> None:
+        self._log_content.setVisible(expanded)
+        self._log_toggle_btn.setText("Log  \u25bc" if expanded else "Log  \u25b6")
+
+    # Pipeline stages for progress tracking (order matters).
+    _PIPELINE_STAGES = [
+        ("Model init",          "Initializing RoMa"),
+        ("Dense match",         "Running dense match"),
+        ("Pre-alignment",       "Estimating global pre-alignment"),
+        ("Iterative re-match",  "Iterative re-match"),
+        ("Warp build",          "Building source->reference warp"),
+        ("Guided filter",       "Applying guided-filter"),
+        ("Sampling",            "Sampling correspondences"),
+        ("Color transfer",      "Applying color"),
+        ("Diagnostics",         "Building diagnostics"),
+        ("Done",                "Done"),
+    ]
 
     def _build_progress_group(self) -> QGroupBox:
         group = QGroupBox("Status")
@@ -1439,6 +1284,19 @@ class PhotoColorizerQt(QMainWindow):
             state.setWordWrap(True)
             setattr(self, attr_name, state)
             layout.addWidget(state, row, 1)
+
+        next_row = 4
+        # Progress bar
+        self.pipeline_progress = QProgressBar()
+        self.pipeline_progress.setRange(0, len(self._PIPELINE_STAGES))
+        self.pipeline_progress.setValue(0)
+        self.pipeline_progress.setTextVisible(True)
+        self.pipeline_progress.setFormat("")  # stage text set manually
+        self.pipeline_progress.setFixedHeight(18)
+        self.pipeline_progress.setVisible(False)
+        layout.addWidget(self.pipeline_progress, next_row, 0, 1, 2)
+
+        self._pipeline_stage_index = 0
         return group
 
 
@@ -1566,21 +1424,21 @@ class PhotoColorizerQt(QMainWindow):
         self.bw_black_clip_spin.setDecimals(3)
         self.bw_black_clip_spin.setRange(0.000, 0.190)
         self.bw_black_clip_spin.setSingleStep(0.005)
-        self.bw_black_clip_spin.setValue(0.010)
+        self.bw_black_clip_spin.setValue(0.003)
         form.addRow("B&W black clip", self.bw_black_clip_spin)
 
         self.bw_white_clip_spin = QDoubleSpinBox()
         self.bw_white_clip_spin.setDecimals(3)
         self.bw_white_clip_spin.setRange(0.000, 0.190)
         self.bw_white_clip_spin.setSingleStep(0.005)
-        self.bw_white_clip_spin.setValue(0.010)
+        self.bw_white_clip_spin.setValue(0.003)
         form.addRow("B&W white clip", self.bw_white_clip_spin)
 
         self.bw_midtone_target_spin = QDoubleSpinBox()
         self.bw_midtone_target_spin.setDecimals(2)
         self.bw_midtone_target_spin.setRange(0.05, 0.95)
         self.bw_midtone_target_spin.setSingleStep(0.01)
-        self.bw_midtone_target_spin.setValue(0.55)
+        self.bw_midtone_target_spin.setValue(0.50)
         form.addRow("B&W midtone target", self.bw_midtone_target_spin)
 
         self.reg_thresh_spin = QDoubleSpinBox()
@@ -1774,6 +1632,21 @@ class PhotoColorizerQt(QMainWindow):
         if path.exists() and path.is_file():
             pix = QPixmap(str(path))
             if not pix.isNull():
+                # If there are unsaved results, prompt the user before clearing
+                if self._result_pixmaps and not self._result_saved:
+                    reply = QMessageBox.question(
+                        self,
+                        "Unsaved result",
+                        "You have an unsaved colorized result. Save it before loading a new image?",
+                        QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                        QMessageBox.Save,
+                    )
+                    if reply == QMessageBox.Save:
+                        self._save_result_dialog()
+                    elif reply == QMessageBox.Cancel:
+                        return
+                # Clear previous result when loading a new input image
+                self._clear_result_for_new_input()
                 self._input_preview_pixmap = pix
                 if hasattr(self, "input_preview_path"):
                     self.input_preview_path.setText(str(path))
@@ -1783,6 +1656,21 @@ class PhotoColorizerQt(QMainWindow):
         if hasattr(self, "input_preview_path"):
             self.input_preview_path.setText("")
         self._refresh_output_previews()
+
+    def _clear_result_for_new_input(self) -> None:
+        """Clear all result previews and state when a new input image is loaded."""
+        self._clear_preview_tabs()
+        self._c1_preview_pixmap = None
+        self._result_saved = True
+        self._stop_shimmer()
+        self._before_after_active = False
+        if hasattr(self, "save_result_btn"):
+            self.save_result_btn.setEnabled(False)
+        if hasattr(self, "open_result_btn"):
+            self.open_result_btn.setEnabled(False)
+        if hasattr(self, "color_edit"):
+            self.color_edit.clear()
+        self._set_selected_output_preview(None)
 
     def _sync_c1_preview_from_field(self) -> None:
         if not hasattr(self, "color_edit"):
@@ -1821,6 +1709,44 @@ class PhotoColorizerQt(QMainWindow):
             c1_path = Path(self.color_edit.text().strip())
             if c1_path.exists() and c1_path.is_file():
                 return c1_path
+        return None
+
+    def _save_result_dialog(self) -> None:
+        """Open a Save As dialog for the final colorized image."""
+        source = self._get_final_result_path()
+        if source is None or not source.exists():
+            QMessageBox.warning(self, "No result", "No colorized result available to save.")
+            return
+        downloads = self._default_downloads_dir()
+        # Default filename: original B&W name + "_colorized"
+        bw_path = Path(self.bw_edit.text().strip()) if hasattr(self, "bw_edit") else None
+        if bw_path and bw_path.stem:
+            save_name = f"{bw_path.stem}_colorized.png"
+        else:
+            save_name = source.name
+        suggested = Path(downloads) / save_name
+        dest, _ = QFileDialog.getSaveFileName(
+            self, "Save Colorized Result", str(suggested),
+            "PNG (*.png);;JPEG (*.jpg *.jpeg);;All files (*)",
+        )
+        if not dest:
+            return
+        try:
+            shutil.copy2(str(source), dest)
+            self._result_saved = True
+            self._append_log(f"[INFO] Result saved to: {dest}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Save failed", f"Could not save result:\n{exc}")
+
+    def _get_final_result_path(self) -> Path | None:
+        """Return the path to the final colorized result image, if it exists."""
+        if self._last_run_outdir is not None:
+            final = self._last_run_outdir / "final_colorized.png"
+            if final.exists():
+                return final
+        outdir = Path(self.outdir_edit.text().strip()) if hasattr(self, "outdir_edit") else None
+        if outdir and (outdir / "final_colorized.png").exists():
+            return outdir / "final_colorized.png"
         return None
 
     def _open_selected_preview_location(self) -> None:
@@ -1867,13 +1793,7 @@ class PhotoColorizerQt(QMainWindow):
     def _next_run_output_dir(self) -> Path:
         base = self.outputs_root_dir
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        suffix = ""
-        if self._active_test_preset_id:
-            raw = str(self._active_test_preset_id)
-            safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in raw).strip("_")
-            if safe:
-                suffix = f"_{safe}"
-        candidate = base / f"colorize_{stamp}{suffix}"
+        candidate = base / f"colorize_{stamp}"
         if not candidate.exists():
             return candidate
         i = 1
@@ -1919,7 +1839,8 @@ class PhotoColorizerQt(QMainWindow):
                 "padding: 2px 10px; border-radius: 8px; background: #2f6c48; color: #def7e8;"
             )
             self.result_preview_path.setText(str(path) if path else "")
-            self.open_result_btn.setEnabled(path is not None and path.exists())
+            has_outdir = self._last_run_outdir is not None and self._last_run_outdir.exists()
+            self.open_result_btn.setEnabled(has_outdir)
         elif self._c1_preview_pixmap is not None:
             self._selected_preview_title = None
             self.result_preview_badge.setText("Generating color...")
@@ -1947,110 +1868,12 @@ class PhotoColorizerQt(QMainWindow):
             label.setText(f"Pending - {text}")
             label.setStyleSheet("color: #c7a44b;")
 
-    @staticmethod
-    def _find_test_preset(preset_id: str) -> dict | None:
-        pid = str(preset_id or "").strip()
-        if not pid:
-            return None
-        for preset in TEST_PRESETS:
-            if str(preset.get("id", "")).strip() == pid:
-                return preset
-        return None
-
     def _clear_active_test_preset(self) -> None:
         self._active_test_preset_id = None
         self._active_test_extra_flags = []
 
     def _run_default_workflow(self) -> None:
         self._clear_active_test_preset()
-        self._start_full_workflow()
-
-    def _run_test_preset(self, preset_id: str) -> None:
-        preset = self._find_test_preset(preset_id)
-        if preset is None:
-            QMessageBox.warning(self, "Missing preset", f"Preset not found: {preset_id}")
-            return
-
-        self._active_test_preset_id = str(preset.get("id", "")).strip() or None
-        c1_level = str(preset.get("c1_adherence", "High")).strip() or "High"
-        if hasattr(self, "c1_adherence_combo"):
-            idx = self.c1_adherence_combo.findText(c1_level, Qt.MatchFixedString)
-            if idx >= 0:
-                self.c1_adherence_combo.setCurrentIndex(idx)
-            else:
-                self.c1_adherence_combo.setCurrentText(c1_level)
-        self._active_test_extra_flags = self._c1_adherence_extra_flags(c1_level) + list(
-            preset.get("extra_flags", [])
-        )
-
-        prompt = str(preset.get("prompt", "")).strip()
-        use_preset_prompt = (
-            bool(self.test_preset_use_prompt_check.isChecked())
-            if hasattr(self, "test_preset_use_prompt_check")
-            else False
-        )
-        if prompt and hasattr(self, "prompt_box"):
-            if use_preset_prompt:
-                self.prompt_box.setPlainText(prompt)
-                self._append_log("[INFO] Preset prompt applied to Step 2 editor.")
-            else:
-                self._append_log("[INFO] Keeping your edited Step 2 prompt (preset prompt not applied).")
-
-        setting = str(preset.get("setting", "")).strip()
-        if setting and hasattr(self, "setting_combo"):
-            self.setting_combo.setCurrentText(setting)
-
-        if hasattr(self, "accuracy_mode_check"):
-            self.accuracy_mode_check.setChecked(bool(preset.get("accuracy_mode", True)))
-
-        if hasattr(self, "color_opacity_spin"):
-            try:
-                self.color_opacity_spin.setValue(float(preset.get("color_opacity", 1.0)))
-            except Exception:
-                pass
-
-        advanced = preset.get("advanced", {}) if isinstance(preset.get("advanced", {}), dict) else {}
-        if advanced:
-            try:
-                self.gf_radius_spin.setValue(int(advanced.get("gf_radius", self.gf_radius_spin.value())))
-                self.gf_eps_spin.setValue(float(advanced.get("gf_eps", self.gf_eps_spin.value())))
-                self.chroma_radius_spin.setValue(int(advanced.get("chroma_radius", self.chroma_radius_spin.value())))
-                self.chroma_boost_spin.setValue(float(advanced.get("chroma_boost", self.chroma_boost_spin.value())))
-                self.chroma_edge_preserve_spin.setValue(
-                    float(advanced.get("chroma_edge_preserve", self.chroma_edge_preserve_spin.value()))
-                )
-                self.bw_gray_balance_check.setChecked(
-                    bool(advanced.get("bw_gray_balance", self.bw_gray_balance_check.isChecked()))
-                )
-                self.bw_black_clip_spin.setValue(
-                    float(advanced.get("bw_black_clip", self.bw_black_clip_spin.value()))
-                )
-                self.bw_white_clip_spin.setValue(
-                    float(advanced.get("bw_white_clip", self.bw_white_clip_spin.value()))
-                )
-                self.bw_midtone_target_spin.setValue(
-                    float(advanced.get("bw_midtone_target", self.bw_midtone_target_spin.value()))
-                )
-                self.adaptive_chroma_check.setChecked(
-                    bool(advanced.get("adaptive_chroma", self.adaptive_chroma_check.isChecked()))
-                )
-                self.reg_thresh_spin.setValue(float(advanced.get("reg_thresh", self.reg_thresh_spin.value())))
-                reg_fb = str(advanced.get("reg_fallback", self.reg_fallback_combo.currentText()))
-                self.reg_fallback_combo.setCurrentText(reg_fb)
-                self.num_samples_spin.setValue(int(advanced.get("num_samples", self.num_samples_spin.value())))
-                self.max_draw_spin.setValue(int(advanced.get("max_draw", self.max_draw_spin.value())))
-            except Exception as exc:
-                self._append_log(f"[WARN] Could not fully apply preset advanced settings: {exc}")
-
-        self._append_log("")
-        self._append_log(f"[INFO] Applied test preset: {self._active_test_preset_id}")
-        desc = str(preset.get("description", "")).strip()
-        if desc:
-            self._append_log(f"[INFO] Preset details: {desc}")
-        self._append_log(f"[INFO] C1 adherence effort: {c1_level}")
-        if self._active_test_extra_flags:
-            self._append_log("[INFO] Extra run flags: " + " ".join(self._active_test_extra_flags))
-
         self._start_full_workflow()
 
     def _python_executable_for_child_process(self) -> Path:
@@ -2634,6 +2457,8 @@ class PhotoColorizerQt(QMainWindow):
         self._auto_get_c1_poll_deadline_monotonic = None
         self._auto_get_c1_poll_attempt = 0
 
+    _C1_MIN_WAIT_SEC = 30  # ChatGPT needs at least this long to generate an image
+
     def _start_auto_get_c1_poll(self, *, timeout_sec: int = 1800, interval_ms: int = 7000) -> None:
         if self._auto_get_c1_polling:
             return
@@ -2642,9 +2467,13 @@ class PhotoColorizerQt(QMainWindow):
         self._auto_get_c1_poll_deadline_monotonic = time.monotonic() + max(30, int(timeout_sec))
         self._append_log(
             "[INFO] Auto workflow: waiting for ChatGPT image generation; "
-            "Get C1 will auto-download/import when ready."
+            f"first check in ~{self._C1_MIN_WAIT_SEC}s."
         )
-        QTimer.singleShot(max(1000, int(interval_ms)), lambda: self._auto_get_c1_poll_tick(interval_ms))
+        # Wait at least _C1_MIN_WAIT_SEC before the first poll — ChatGPT needs
+        # time to generate the image. Polling too early can capture the uploaded
+        # B&W image instead.
+        first_delay = max(self._C1_MIN_WAIT_SEC * 1000, int(interval_ms))
+        QTimer.singleShot(first_delay, lambda: self._auto_get_c1_poll_tick(interval_ms))
 
     def _auto_get_c1_poll_tick(self, interval_ms: int) -> None:
         if not self._auto_get_c1_polling:
@@ -2654,11 +2483,27 @@ class PhotoColorizerQt(QMainWindow):
             return
         deadline = self._auto_get_c1_poll_deadline_monotonic
         if deadline is not None and time.monotonic() >= deadline:
+            self._stop_auto_get_c1_poll()
+            if self._full_workflow_active and self._full_workflow_waiting_for_c1:
+                if not self._c1_image_nudge_sent:
+                    self._append_log(
+                        "[WARN] Auto Get C1 timed out. Sending nudge to ChatGPT..."
+                    )
+                    self._c1_image_nudge_sent = True
+                    self._nudge_chatgpt_for_image()
+                    return
+                if self._c1_workflow_retry_count < 2:
+                    self._c1_workflow_retry_count += 1
+                    self._append_log(
+                        f"[WARN] Auto Get C1 timed out after nudge. "
+                        f"Deleting chat and retrying (attempt {self._c1_workflow_retry_count + 1}/3)..."
+                    )
+                    self._retry_c1_workflow_from_scratch()
+                    return
             self._append_log(
                 "[WARN] Auto Get C1 timed out waiting for a downloadable ChatGPT image. "
                 "Click ChatGPT's Download button manually; this app will still auto-import the next completed image."
             )
-            self._stop_auto_get_c1_poll()
             if self._full_workflow_active and self._full_workflow_waiting_for_c1:
                 self._set_status("Waiting for manual ChatGPT download...")
             return
@@ -2871,9 +2716,26 @@ class PhotoColorizerQt(QMainWindow):
     }
   }
 
-  const visuals = Array.from(
-    document.querySelectorAll('img,picture,canvas,figure [role="img"],div[role="img"]')
+  // Only look for visuals inside assistant responses to avoid clicking the uploaded B&W image.
+  let visuals = Array.from(
+    document.querySelectorAll(
+      '[data-message-author-role="assistant"] img,' +
+      '[data-message-author-role="assistant"] picture,' +
+      '[data-message-author-role="assistant"] canvas,' +
+      '.agent-turn img,.agent-turn picture,.agent-turn canvas'
+    )
   ).filter(visible);
+  if (visuals.length === 0) {
+    // Fallback: all visuals except those inside user messages.
+    visuals = Array.from(
+      document.querySelectorAll('img,picture,canvas,figure [role="img"],div[role="img"]')
+    ).filter(el => {
+      if (!visible(el)) return false;
+      if (el.closest?.('[data-message-author-role="user"]')) return false;
+      if (el.closest?.('.user-turn')) return false;
+      return true;
+    });
+  }
   const latestVisual = visuals.length ? visuals[visuals.length - 1] : null;
   if (latestVisual) {
     try {
@@ -2969,6 +2831,70 @@ class PhotoColorizerQt(QMainWindow):
 })();
 """
 
+    @staticmethod
+    def _chatgpt_extract_inline_image_js() -> str:
+        """JS that finds the last large inline <img> in the ChatGPT response,
+        fetches it as a blob, and triggers a download — bypassing any missing
+        download-button / broken-link issues.
+        """
+        return """
+(async () => {
+  const MIN_DIM = 128;
+  // Only look inside assistant message containers to avoid capturing
+  // the uploaded B&W image from user messages.
+  const assistantSelectors = [
+    '[data-message-author-role="assistant"] img',
+    '.agent-turn img',
+    '[class*="assistant"] img',
+  ];
+  let imgs = [];
+  for (const sel of assistantSelectors) {
+    imgs = Array.from(document.querySelectorAll(sel))
+      .filter(el => {
+        if (!el.src) return false;
+        const r = el.getBoundingClientRect();
+        return r.width >= MIN_DIM && r.height >= MIN_DIM;
+      });
+    if (imgs.length > 0) break;
+  }
+  // Fallback: if no assistant-scoped images found, try all large images
+  // but exclude known user-upload containers.
+  if (imgs.length === 0) {
+    imgs = Array.from(document.querySelectorAll('img'))
+      .filter(el => {
+        if (!el.src) return false;
+        if (el.closest('[data-message-author-role="user"]')) return false;
+        if (el.closest('.user-turn')) return false;
+        const r = el.getBoundingClientRect();
+        return r.width >= MIN_DIM && r.height >= MIN_DIM;
+      });
+  }
+  if (imgs.length === 0) {
+    return { ok: false, reason: 'no_large_inline_image' };
+  }
+  const img = imgs[imgs.length - 1];
+  try {
+    const resp = await fetch(img.src, { mode: 'cors', credentials: 'include' });
+    if (!resp.ok) {
+      return { ok: false, reason: 'fetch_failed', status: resp.status };
+    }
+    const blob = await resp.blob();
+    const ext = blob.type === 'image/jpeg' ? '.jpg' : '.png';
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'chatgpt_image' + ext;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    return { ok: true, via: 'inline_image_extract' };
+  } catch (err) {
+    return { ok: false, reason: 'extract_error', detail: String(err) };
+  }
+})();
+"""
+
     def _attempt_chatgpt_download(self, retries: int = 6, delay_ms: int = 600, *, quiet: bool = False) -> None:
         if self._c1_download_request_seen:
             return
@@ -2994,12 +2920,8 @@ class PhotoColorizerQt(QMainWindow):
 
             if retries <= 0:
                 if not self._c1_download_request_seen:
-                    self._awaiting_c1_download = False
-                    if not quiet:
-                        self._append_log(
-                            "[WARN] Could not auto-click a Download control. Click ChatGPT's download button manually; "
-                            "this app will auto-import the next completed image download."
-                        )
+                    # Fallback: try extracting the inline image directly from the DOM
+                    self._attempt_inline_image_extract(quiet=quiet)
                 return
 
             if not quiet and retries in (6, 3):
@@ -3016,6 +2938,125 @@ class PhotoColorizerQt(QMainWindow):
             page.runJavaScript(menu_js, _after_menu)
 
         page.runJavaScript(js, _after)
+
+    def _attempt_inline_image_extract(self, *, quiet: bool = False) -> None:
+        """Fallback: extract the last large inline image from the ChatGPT DOM
+        and trigger a download via fetch+blob. Handles cases where ChatGPT
+        shows a clickable link instead of a download button."""
+        if self._c1_download_request_seen:
+            return
+        page = self.browser.page() if hasattr(self, "browser") else None
+        if page is None:
+            self._awaiting_c1_download = False
+            return
+        if not quiet:
+            self._append_log("[INFO] Download button not found — trying to extract inline image from page...")
+        js = self._chatgpt_extract_inline_image_js()
+
+        def _after_extract(result) -> None:
+            if self._c1_download_request_seen:
+                return
+            ok = isinstance(result, dict) and bool(result.get("ok"))
+            if ok:
+                via = str(result.get("via", "unknown"))
+                if not quiet:
+                    self._append_log(f"[INFO] C1 image extracted from page ({via}).")
+                return
+            # Truly failed — try workflow recovery if we're in the automated workflow
+            self._awaiting_c1_download = False
+            reason = str(result.get("reason", "unknown")) if isinstance(result, dict) else "unknown"
+            if self._full_workflow_active and self._full_workflow_waiting_for_c1:
+                if not self._c1_image_nudge_sent:
+                    # First failure: send a follow-up nudge message asking ChatGPT to show the image
+                    self._c1_image_nudge_sent = True
+                    self._append_log(
+                        f"[INFO] No inline image found ({reason}). "
+                        "Sending follow-up nudge to ChatGPT..."
+                    )
+                    self._nudge_chatgpt_for_image()
+                    return
+                # Nudge already sent and still no image — delete chat and retry
+                if self._c1_workflow_retry_count < 2:
+                    self._c1_workflow_retry_count += 1
+                    self._append_log(
+                        f"[WARN] ChatGPT did not display an image after nudge. "
+                        f"Deleting chat and retrying (attempt {self._c1_workflow_retry_count + 1}/3)..."
+                    )
+                    self._retry_c1_workflow_from_scratch()
+                    return
+                # Exhausted retries
+                self._append_log(
+                    "[WARN] ChatGPT failed to display an image after 3 attempts. "
+                    "Click ChatGPT's download button manually; "
+                    "this app will auto-import the next completed image download."
+                )
+                return
+            if not quiet:
+                self._append_log(
+                    f"[WARN] Could not extract inline image ({reason}). "
+                    "Click ChatGPT's download button manually; "
+                    "this app will auto-import the next completed image download."
+                )
+
+        page.runJavaScript(js, _after_extract)
+
+    _C1_NUDGE_MESSAGE = (
+        "Please display the final restored image directly in the chat as an inline image. "
+        "Do not provide a download link — show the image itself."
+    )
+
+    def _nudge_chatgpt_for_image(self) -> None:
+        """Send a short follow-up message asking ChatGPT to re-display the image inline."""
+        self._append_log("[INFO] Sending nudge: asking ChatGPT to display the image inline...")
+        self._paste_prompt_clipboard_then_send(
+            self._C1_NUDGE_MESSAGE,
+            send_retries=12,
+            send_delay_ms=700,
+        )
+        # Resume polling to pick up the image after ChatGPT responds
+        self._start_auto_get_c1_poll(timeout_sec=120, interval_ms=8000)
+
+    def _retry_c1_workflow_from_scratch(self) -> None:
+        """Delete the current chat, navigate to a fresh ChatGPT page, and re-run
+        the full workflow (re-attach B&W image + re-send prompt)."""
+        self._stop_auto_get_c1_poll()
+
+        def _after_delete(success: bool) -> None:
+            if success:
+                self._append_log("[INFO] Retry: old chat deleted.")
+            else:
+                self._append_log("[WARN] Retry: could not confirm chat deletion. Continuing anyway.")
+            # Navigate to a fresh ChatGPT chat
+            self._append_log("[INFO] Retry: opening fresh ChatGPT chat...")
+            self._navigate_chatgpt()
+            # Re-run the full workflow after the page loads
+            QTimer.singleShot(4000, self._restart_workflow_after_retry)
+
+        self._delete_current_chat_automated(done=_after_delete)
+
+    def _restart_workflow_after_retry(self) -> None:
+        """Re-attach the B&W image and re-send the prompt in a fresh chat."""
+        if not self._full_workflow_active:
+            return
+        bw_path = Path(self.bw_edit.text().strip())
+        if not bw_path.exists():
+            self._append_log("[WARN] Retry aborted: B&W image not found.")
+            self._full_workflow_active = False
+            self._set_status("Ready")
+            self._refresh_workflow_status()
+            return
+        self._c1_image_nudge_sent = False
+        self._c1_download_request_seen = False
+        self._awaiting_c1_download = False
+        self._auto_color_step1_after_attach = True
+        self._auto_color_step1_scheduled = False
+        self._full_workflow_waiting_for_c1 = True
+        self._full_workflow_pending_delete = True
+        attempt = self._c1_workflow_retry_count + 1
+        self._append_log(f"[INFO] Retry: re-running workflow (attempt {attempt}/3)...")
+        self._set_status(f"Retrying ChatGPT workflow (attempt {attempt}/3)...")
+        self.pending_bw_upload_path = bw_path
+        self._attach_selected_bw_to_chatgpt()
 
     @staticmethod
     def _sanitize_download_filename(filename: str) -> str:
@@ -3320,6 +3361,7 @@ class PhotoColorizerQt(QMainWindow):
             if ok:
                 via = str(parsed.get("via", "unknown"))
                 self._append_log(f"[INFO] Color Step 1 sent to ChatGPT ({via}).")
+                self._c1_prompt_sent_monotonic = time.monotonic()
                 if self._auto_get_c1_after_send:
                     self._auto_get_c1_after_send = False
                     self._start_auto_get_c1_poll(timeout_sec=1800, interval_ms=7000)
@@ -3351,6 +3393,7 @@ class PhotoColorizerQt(QMainWindow):
 
             self._append_log("[WARN] Send button click failed. Trying Enter-key fallback.")
             self._chatgpt_send_enter_fallback()
+            self._c1_prompt_sent_monotonic = time.monotonic()
             if self._auto_get_c1_after_send:
                 self._auto_get_c1_after_send = False
                 self._append_log(
@@ -3489,12 +3532,26 @@ class PhotoColorizerQt(QMainWindow):
         except Exception:
             pass
         item.accept()
-        if self._awaiting_c1_download:
+
+        # Guard: reject downloads that arrive too soon after the prompt was sent.
+        # ChatGPT cannot generate an image in <25s, so any download this early
+        # is almost certainly the uploaded B&W image, not the C1 result.
+        too_early = False
+        if self._c1_prompt_sent_monotonic is not None:
+            elapsed = time.monotonic() - self._c1_prompt_sent_monotonic
+            if elapsed < self._C1_MIN_WAIT_SEC:
+                too_early = True
+                self._append_log(
+                    f"[INFO] Download ignored (only {elapsed:.0f}s since prompt — "
+                    "likely the uploaded B&W image, not the C1 result)."
+                )
+
+        if self._awaiting_c1_download and not too_early:
             self._c1_download_request_seen = True
             self._awaiting_c1_download = False
             self._append_log("[INFO] C1 download started from ChatGPT.")
             self._stop_auto_get_c1_poll()
-        if self._auto_import_next_download and self._pending_auto_import_download_path is None:
+        if self._auto_import_next_download and self._pending_auto_import_download_path is None and not too_early:
             self._pending_auto_import_download_path = target_path
             self._append_log("[INFO] Get C1: captured download request; will import automatically after completion.")
         self._append_log(f"[INFO] Download started: {target_path}")
@@ -3761,9 +3818,17 @@ class PhotoColorizerQt(QMainWindow):
         self._full_workflow_active = True
         self._full_workflow_waiting_for_c1 = True
         self._full_workflow_pending_delete = True
+        self._c1_image_nudge_sent = False
         self._set_status("Running ChatGPT workflow...")
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
+        # Start shimmer immediately with loading messages (no C1 source yet)
+        if hasattr(self, "shimmer_widget") and hasattr(self, "result_stack"):
+            self.shimmer_widget.set_source(None)
+            self.shimmer_widget.start()
+            self.result_stack.setCurrentIndex(1)
+            self._shimmer_active = True
+            self._before_after_active = False
         self._append_log("")
         self._append_log(
             "[INFO] Colorize workflow started: upload photo -> send prompt -> auto Get C1 -> delete chat -> overlay run."
@@ -3872,18 +3937,12 @@ class PhotoColorizerQt(QMainWindow):
             cmd.append("--compile")
         if hasattr(self, "border_exclude_check") and self.border_exclude_check.isChecked():
             cmd.append("--border-exclude-mask")
-        if not self._active_test_extra_flags:
-            cmd.extend(self._c1_adherence_extra_flags())
-        if self._active_test_extra_flags:
-            cmd.extend(self._active_test_extra_flags)
+        cmd.extend(self._c1_adherence_extra_flags())
 
         self._append_log("")
         self._append_log("=== Colorization Run ===")
-        if self._active_test_preset_id:
-            self._append_log(f"Test preset: {self._active_test_preset_id}")
-        else:
-            if hasattr(self, "c1_adherence_combo"):
-                self._append_log(f"C1 adherence effort: {self.c1_adherence_combo.currentText()}")
+        if hasattr(self, "c1_adherence_combo"):
+            self._append_log(f"C1 adherence effort: {self.c1_adherence_combo.currentText()}")
         self._append_log(f"B&W Original: {bw_path}")
         self._append_log(f"AI Colorized: {color_path}")
         self._append_log(f"Output: {outdir}")
@@ -3911,6 +3970,7 @@ class PhotoColorizerQt(QMainWindow):
         self.stop_btn.setEnabled(True)
         self._set_status("Running...")
         self._run_watchdog.start()
+        self._reset_pipeline_progress()
 
         proc.start(cmd[0], cmd[1:])
 
@@ -3926,6 +3986,44 @@ class PhotoColorizerQt(QMainWindow):
         else:
             self._append_log("[INFO] Colorize runner started.")
 
+    # Map pipeline log keywords to stage indices for progress tracking.
+    _STAGE_TRIGGERS = [
+        ("Initializing RoMa",                    0),  # Model init
+        ("Running dense match (ref -> src)",      1),  # Dense match
+        ("Estimating global pre-alignment",       2),  # Pre-alignment
+        ("Iterative re-match refinement",         3),  # Iterative re-match
+        ("Building source->reference warp",       4),  # Warp build
+        ("Applying guided-filter smoothing",      5),  # Guided filter
+        ("Sampling correspondences",              6),  # Sampling
+        ("B&W base normalized",                   7),  # Color transfer
+        ("Building before/after diagnostic",      8),  # Diagnostics
+        ("[INFO] Done.",                           9),  # Done
+    ]
+
+    def _reset_pipeline_progress(self) -> None:
+        self._pipeline_stage_index = 0
+        if hasattr(self, "pipeline_progress"):
+            self.pipeline_progress.setValue(0)
+            self.pipeline_progress.setFormat("Starting...")
+            self.pipeline_progress.setVisible(True)
+
+    def _update_pipeline_progress(self, line: str) -> None:
+        if not hasattr(self, "pipeline_progress"):
+            return
+        for trigger_text, stage_idx in self._STAGE_TRIGGERS:
+            if trigger_text in line and stage_idx >= self._pipeline_stage_index:
+                self._pipeline_stage_index = stage_idx + 1
+                label = self._PIPELINE_STAGES[stage_idx][0]
+                self.pipeline_progress.setValue(self._pipeline_stage_index)
+                self.pipeline_progress.setFormat(f"{label}")
+                break
+        if "[ERROR]" in line:
+            self.pipeline_progress.setFormat("Error")
+
+    def _hide_pipeline_progress(self) -> None:
+        if hasattr(self, "pipeline_progress"):
+            self.pipeline_progress.setVisible(False)
+
     def _on_process_output(self) -> None:
         if self.process is None:
             return
@@ -3936,7 +4034,9 @@ class PhotoColorizerQt(QMainWindow):
         self._process_partial += raw
         while "\n" in self._process_partial:
             line, self._process_partial = self._process_partial.split("\n", 1)
-            self._append_log(line.rstrip())
+            stripped = line.rstrip()
+            self._append_log(stripped)
+            self._update_pipeline_progress(stripped)
 
     def _on_process_error(self, error) -> None:
         if self.process is None:
@@ -3953,6 +4053,7 @@ class PhotoColorizerQt(QMainWindow):
             self._last_process_output_monotonic = None
             self._last_run_watchdog_log_monotonic = None
             self._set_status("Failed")
+            self._hide_pipeline_progress()
             self._refresh_workflow_status()
 
     def _on_run_watchdog_tick(self) -> None:
@@ -3998,9 +4099,9 @@ class PhotoColorizerQt(QMainWindow):
             self._append_log("Colorization complete.")
             self._stop_shimmer()
             self._load_outputs()
-            active_outdir = self._last_run_outdir or Path(self.outdir_edit.text().strip())
-            if active_outdir.exists():
-                self._copy_final_result_to_downloads(active_outdir)
+            self._result_saved = False
+            if hasattr(self, "save_result_btn"):
+                self.save_result_btn.setEnabled(True)
             self._set_status("Done!")
             self._show_results_tab()
             self._clear_active_test_preset()
@@ -4021,6 +4122,7 @@ class PhotoColorizerQt(QMainWindow):
         self._run_started_monotonic = None
         self._last_process_output_monotonic = None
         self._last_run_watchdog_log_monotonic = None
+        self._hide_pipeline_progress()
         self._refresh_workflow_status()
 
     def _stop_run(self) -> None:
@@ -4125,12 +4227,21 @@ class PhotoColorizerQt(QMainWindow):
             return
 
         if has_c1 and not has_final:
-            # Shimmer mode — C1 imported but final not yet generated
-            self.shimmer_widget.set_source(self._c1_preview_pixmap)
-            self.shimmer_widget.start()
+            # Shimmer mode — C1 imported but final not yet generated.
+            # If shimmer is already running (started at workflow launch), just
+            # update the source so the C1 image fades in smoothly.
+            if self._shimmer_active:
+                self.shimmer_widget.set_source(self._c1_preview_pixmap)
+            else:
+                self.shimmer_widget.set_source(self._c1_preview_pixmap)
+                self.shimmer_widget.start()
             self.result_stack.setCurrentIndex(1)
             self._shimmer_active = True
             self._before_after_active = False
+            return
+
+        # If shimmer is running (workflow in progress, no C1 yet), keep it
+        if self._shimmer_active and not has_final:
             return
 
         # Default: placeholder label
