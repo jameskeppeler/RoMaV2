@@ -23,6 +23,7 @@ build-backend = "uv_build"
 
 [project.optional-dependencies]
 gui = [
+    "opencv-python>=4.8.0",
     "pyside6==6.8.3",
 ]
 fused-local-corr = [

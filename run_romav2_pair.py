@@ -495,66 +495,92 @@ def _guided_filter(
     return out
 
 
+_LAB_DELTA = np.float32(6.0 / 29.0)
+_LAB_DELTA3 = _LAB_DELTA ** 3
+_LAB_SCALE = np.float32(1.0 / (3.0 * _LAB_DELTA ** 2))
+_LAB_OFFSET = np.float32(4.0 / 29.0)
+
+
 def _rgb_to_lab(rgb_uint8: np.ndarray) -> np.ndarray:
     """Convert (H, W, 3) uint8 sRGB to CIE-LAB float32. No opencv needed."""
-    rgb = rgb_uint8.astype(np.float32) / 255.0
+    rgb = rgb_uint8.astype(np.float32)
+    rgb *= np.float32(1.0 / 255.0)
 
-    # Linearize sRGB
+    # Linearize sRGB (in-place where possible)
     mask = rgb > 0.04045
-    linear = np.where(mask, ((rgb + 0.055) / 1.055) ** 2.4, rgb / 12.92)
+    linear = np.empty_like(rgb)
+    np.divide(rgb, 12.92, out=linear, where=~mask)
+    hi = ((rgb + 0.055) * np.float32(1.0 / 1.055))
+    np.power(hi, 2.4, out=hi)
+    np.copyto(linear, hi, where=mask)
+    del hi, mask
 
     # Linear RGB -> XYZ (D65)
     r, g, b = linear[..., 0], linear[..., 1], linear[..., 2]
     x = r * 0.4124564 + g * 0.3575761 + b * 0.1804375
     y = r * 0.2126729 + g * 0.7151522 + b * 0.0721750
     z = r * 0.0193339 + g * 0.1191920 + b * 0.9503041
+    del linear
 
     # Normalize by D65 white point
-    x /= 0.95047
-    z /= 1.08883
+    x *= np.float32(1.0 / 0.95047)
+    z *= np.float32(1.0 / 1.08883)
 
-    # XYZ -> LAB
+    # XYZ -> LAB (avoid repeated np.where by computing both branches)
     def _f(t: np.ndarray) -> np.ndarray:
-        delta = 6.0 / 29.0
-        return np.where(t > delta**3, np.cbrt(t), t / (3.0 * delta**2) + 4.0 / 29.0)
+        out = t * _LAB_SCALE + _LAB_OFFSET
+        cbrt_mask = t > _LAB_DELTA3
+        np.copyto(out, np.cbrt(t), where=cbrt_mask)
+        return out
 
     fx, fy, fz = _f(x), _f(y), _f(z)
-    L = 116.0 * fy - 16.0
-    a_ch = 500.0 * (fx - fy)
-    b_ch = 200.0 * (fy - fz)
-    return np.stack([L, a_ch, b_ch], axis=-1).astype(np.float32)
+    del x, y, z
+    out = np.empty(rgb_uint8.shape, dtype=np.float32)
+    out[..., 0] = 116.0 * fy - 16.0
+    out[..., 1] = 500.0 * (fx - fy)
+    out[..., 2] = 200.0 * (fy - fz)
+    return out
 
 
 def _lab_to_rgb(lab: np.ndarray) -> np.ndarray:
     """Convert (H, W, 3) float32 CIE-LAB to uint8 sRGB. No opencv needed."""
     L, a_ch, b_ch = lab[..., 0], lab[..., 1], lab[..., 2]
 
-    fy = (L + 16.0) / 116.0
-    fx = a_ch / 500.0 + fy
-    fz = fy - b_ch / 200.0
+    fy = (L + 16.0) * np.float32(1.0 / 116.0)
+    fx = a_ch * np.float32(1.0 / 500.0) + fy
+    fz = fy - b_ch * np.float32(1.0 / 200.0)
 
-    delta = 6.0 / 29.0
+    _3d2 = np.float32(3.0 * _LAB_DELTA ** 2)
 
     def _finv(t: np.ndarray) -> np.ndarray:
-        return np.where(t > delta, t**3, 3.0 * delta**2 * (t - 4.0 / 29.0))
+        out = _3d2 * (t - _LAB_OFFSET)
+        cube_mask = t > _LAB_DELTA
+        np.copyto(out, t ** 3, where=cube_mask)
+        return out
 
     x = 0.95047 * _finv(fx)
     y = _finv(fy)
     z = 1.08883 * _finv(fz)
+    del fx, fy, fz
 
-    # XYZ -> linear RGB
-    r = x * 3.2404542 + y * -1.5371385 + z * -0.4985314
-    g = x * -0.9692660 + y * 1.8760108 + z * 0.0415560
-    b = x * 0.0556434 + y * -0.2040259 + z * 1.0572252
+    # XYZ -> linear RGB, write directly into output array
+    out = np.empty(lab.shape, dtype=np.float32)
+    out[..., 0] = x * 3.2404542 + y * -1.5371385 + z * -0.4985314
+    out[..., 1] = x * -0.9692660 + y * 1.8760108 + z * 0.0415560
+    out[..., 2] = x * 0.0556434 + y * -0.2040259 + z * 1.0572252
+    del x, y, z
 
-    # Gamma-compress to sRGB
-    linear = np.stack([r, g, b], axis=-1).clip(0.0, 1.0)
-    srgb = np.where(
-        linear > 0.0031308,
-        1.055 * np.power(linear, 1.0 / 2.4) - 0.055,
-        12.92 * linear,
-    )
-    return (srgb.clip(0.0, 1.0) * 255.0).round().astype(np.uint8)
+    # Gamma-compress to sRGB (in-place)
+    np.clip(out, 0.0, 1.0, out=out)
+    lo_mask = out <= 0.0031308
+    hi = 1.055 * np.power(out, np.float32(1.0 / 2.4)) - 0.055
+    out *= 12.92  # low branch in-place
+    np.copyto(out, hi, where=~lo_mask)
+    del hi, lo_mask
+    np.clip(out, 0.0, 1.0, out=out)
+    out *= 255.0
+    np.round(out, out=out)
+    return out.astype(np.uint8)
 
 
 def _lum_rgb01(rgb_01: np.ndarray) -> np.ndarray:
@@ -940,28 +966,32 @@ def _scan_uniform_margin(
     min_border_frac: float = 0.90,
     max_texture: float = 9.0,
 ) -> int:
+    if max_crop <= 0:
+        return 0
     h, w = luma.shape
-    margin = 0
-    for i in range(max_crop):
-        if side == "top":
-            bm = border_mask[i, :]
-            ll = luma[i, :]
-        elif side == "bottom":
-            bm = border_mask[h - 1 - i, :]
-            ll = luma[h - 1 - i, :]
-        elif side == "left":
-            bm = border_mask[:, i]
-            ll = luma[:, i]
-        else:  # right
-            bm = border_mask[:, w - 1 - i]
-            ll = luma[:, w - 1 - i]
+    # Extract a slab of lines for the requested side and vectorise the checks.
+    if side == "top":
+        n = min(max_crop, h)
+        bm_slab = border_mask[:n, :]          # (n, w)
+        lu_slab = luma[:n, :]
+    elif side == "bottom":
+        n = min(max_crop, h)
+        bm_slab = border_mask[h - n:, :][::-1]  # reverse so index 0 = outermost
+        lu_slab = luma[h - n:, :][::-1]
+    elif side == "left":
+        n = min(max_crop, w)
+        bm_slab = border_mask[:, :n].T        # (n, h)
+        lu_slab = luma[:, :n].T
+    else:  # right
+        n = min(max_crop, w)
+        bm_slab = border_mask[:, w - n:][:, ::-1].T
+        lu_slab = luma[:, w - n:][:, ::-1].T
 
-        if float(bm.mean()) < min_border_frac:
-            break
-        if _line_texture_1d(ll) > max_texture:
-            break
-        margin += 1
-    return margin
+    border_fracs = bm_slab.mean(axis=1)                          # (n,)
+    textures = np.mean(np.abs(np.diff(lu_slab.astype(np.float32), axis=1)), axis=1)  # (n,)
+    fail = (border_fracs < min_border_frac) | (textures > max_texture)
+    idxs = np.nonzero(fail)[0]
+    return int(idxs[0]) if idxs.size > 0 else n
 
 
 def _auto_crop_border_like_margin(
@@ -1389,11 +1419,9 @@ def _match_with_current_model(
     ref_img: Image.Image,
     src_tensor: torch.Tensor,
 ):
-    """Match ref against a tensor source by converting to PIL in-memory."""
-    src_uint8 = _tensor_chw_to_uint8(src_tensor[0])
-    src_pil = Image.fromarray(src_uint8)
-    preds = model.match(ref_img, src_pil)
-    return preds, src_pil
+    """Match ref against a GPU tensor source directly (no GPU→CPU→GPU roundtrip)."""
+    preds = model.match(ref_img, src_tensor)
+    return preds, None
 
 
 def main() -> int:
@@ -2109,6 +2137,7 @@ def main() -> int:
     overlap_ab = preds.get("overlap_AB")
     overlap_small: torch.Tensor | None = None
     overlap_full: torch.Tensor | None = None
+    overlap_full_np: np.ndarray | None = None
     stage_start = perf_counter()
     if isinstance(overlap_ab, torch.Tensor):
         overlap_small = overlap_ab[0, ..., 0]
@@ -2124,6 +2153,8 @@ def main() -> int:
             mode="bilinear",
             align_corners=False,
         )[0, 0]
+        # Cache the CPU numpy copy — used in 3+ places downstream.
+        overlap_full_np = overlap_full.detach().cpu().numpy()
         vis_w, vis_h = _fit_within_size(ref_w, ref_h, args.diag_max_side)
         if (vis_w, vis_h) != (ref_w, ref_h):
             overlap_vis = F.interpolate(
@@ -2136,7 +2167,7 @@ def main() -> int:
             ref_vis = ref_img.resize((vis_w, vis_h), resample=_resample_bicubic())
             ref_np = np.asarray(ref_vis, dtype=np.float32)
         else:
-            overlap_vis_np = overlap_full.detach().cpu().numpy()
+            overlap_vis_np = overlap_full_np
             ref_np = np.asarray(ref_img, dtype=np.float32)
         overlap_color_np = _overlap_to_color(overlap_vis_np)
 
@@ -2260,13 +2291,14 @@ def main() -> int:
     # Pipeline order: smooth RAW warp → THEN apply confidence mask (once).
     gf_radius = int(args.guided_filter_radius)
     warped_src_smooth: torch.Tensor | None = None
+    # Pre-compute grayscale reference once — used by both warp and chroma guided filters.
+    ref_gray = np.asarray(ref_img.convert("L"), dtype=np.float32) / 255.0
     if gf_radius > 0:
         stage_start = perf_counter()
         print(
             f"[INFO] Applying guided-filter smoothing to warp field "
             f"(radius={gf_radius}, eps={args.guided_filter_eps:.1e}) ..."
         )
-        ref_gray = np.asarray(ref_img.convert("L"), dtype=np.float32) / 255.0
         warp_np = warp_ab_full.detach().cpu().numpy()  # (H, W, 2)
 
         # Smooth the RAW warp (not the confidence-masked one)
@@ -2371,10 +2403,12 @@ def main() -> int:
     regularized_output_path: Path | None = None
     warped_regularized_rgb: np.ndarray | None = None
     warped_regularized_tensor: torch.Tensor | None = None
+    # Pre-compute overlap confidence threshold values (reused in regularization + color transfer).
+    _overlap_tau = float(args.regularize_overlap_thresh)
+    _overlap_denom = max(1e-6, 1.0 - _overlap_tau)
+    _overlap_conf_np: np.ndarray | None = None  # lazily computed numpy version
     if overlap_full is not None and effective_regularize_fallback != "none":
-        tau = float(args.regularize_overlap_thresh)
-        denom = max(1e-6, 1.0 - tau)
-        alpha = ((overlap_full - tau) / denom).clamp(0.0, 1.0).unsqueeze(0)
+        alpha = ((overlap_full - _overlap_tau) / _overlap_denom).clamp(0.0, 1.0).unsqueeze(0)
 
         if effective_regularize_fallback == "identity":
             identity_theta = torch.tensor(
@@ -2418,6 +2452,8 @@ def main() -> int:
 
     # --- Photoshop-style Color blend transfer ---
     stage_start = perf_counter()
+    _cached_smooth_rgb: np.ndarray | None = None
+    _cached_raw_rgb: np.ndarray | None = None
     color_transfer_donor_stage = "none"
     color_transfer_chroma_scale_applied = 1.0
     color_transfer_adaptive_ratio = 1.0
@@ -2427,6 +2463,8 @@ def main() -> int:
     color_transfer_low_conf_fill_stage = "none"
     color_transfer_bw_base_balanced = False
     color_transfer_bw_base_stats: dict[str, float] | None = None
+    # Pre-compute ref RGB once — used by color transfer and diagnostics.
+    ref_rgb = np.asarray(ref_img.convert("RGB"), dtype=np.uint8)
     if not args.no_color_transfer:
         # Prefer regularized warp donor to reduce low-overlap artifacts, then smoothed, then raw.
         if warped_regularized_tensor is not None:
@@ -2439,8 +2477,11 @@ def main() -> int:
             color_donor = warped_src
             donor_stage = "raw"
         color_transfer_donor_stage = donor_stage
-        donor_rgb = _tensor_chw_to_uint8(color_donor)
-        ref_rgb = np.asarray(ref_img.convert("RGB"), dtype=np.uint8)
+        # Reuse already-converted RGB when the donor is the regularized warp.
+        if donor_stage == "regularized" and warped_regularized_rgb is not None:
+            donor_rgb = warped_regularized_rgb
+        else:
+            donor_rgb = _tensor_chw_to_uint8(color_donor)
         if args.disable_bw_gray_balance:
             ref_overlay_rgb = ref_rgb
             print("[INFO] B&W overlay base normalization disabled (--disable-bw-gray-balance).")
@@ -2469,10 +2510,14 @@ def main() -> int:
         # Re-inject chroma from a non-regularized donor in low-confidence regions so color covers the full image.
         if donor_stage == "regularized":
             if warped_src_smooth is not None:
-                fill_rgb = _tensor_chw_to_uint8(warped_src_smooth)
+                if _cached_smooth_rgb is None:
+                    _cached_smooth_rgb = _tensor_chw_to_uint8(warped_src_smooth)
+                fill_rgb = _cached_smooth_rgb
                 fill_stage = "smooth"
             else:
-                fill_rgb = _tensor_chw_to_uint8(warped_src)
+                if _cached_raw_rgb is None:
+                    _cached_raw_rgb = _tensor_chw_to_uint8(warped_src)
+                fill_rgb = _cached_raw_rgb
                 fill_stage = "raw"
             fill_lab = _rgb_to_lab(fill_rgb)
             # Pre-smooth fill chroma to prevent splotchy raw warp colors
@@ -2481,14 +2526,14 @@ def main() -> int:
             smooth_radius = max(int(args.chroma_filter_radius), 12)
             fill_lab[..., 1:3] = _box_filter_2d(fill_ab, smooth_radius)
 
-            if overlap_full is not None:
-                tau = float(args.regularize_overlap_thresh)
-                denom = max(1e-6, 1.0 - tau)
-                conf = np.clip(
-                    (overlap_full.detach().cpu().numpy() - tau) / denom,
-                    0.0,
-                    1.0,
-                ).astype(np.float32, copy=False)
+            if overlap_full_np is not None:
+                if _overlap_conf_np is None:
+                    _overlap_conf_np = np.clip(
+                        (overlap_full_np - _overlap_tau) / _overlap_denom,
+                        0.0,
+                        1.0,
+                    ).astype(np.float32, copy=False)
+                conf = _overlap_conf_np
             else:
                 conf = np.ones((ref_h, ref_w), dtype=np.float32)
 
@@ -2507,7 +2552,7 @@ def main() -> int:
         chroma_radius = int(args.chroma_filter_radius)
         if chroma_radius > 0:
             # Smooth donor chroma with reference luminance as guide.
-            ref_gray = np.asarray(ref_img.convert("L"), dtype=np.float32) / 255.0
+            # ref_gray already computed above (hoisted before guided-filter block)
             donor_ab_raw = donor_lab[..., 1:3].astype(np.float32, copy=True)
             donor_ab_smooth = _guided_filter_with_mp_limit(
                 guide=ref_gray,
@@ -2533,14 +2578,13 @@ def main() -> int:
                 # Suppress edge preservation in low-confidence areas where the
                 # raw warp is unreliable — using raw chroma there causes color
                 # splotching on plain backgrounds.
-                if overlap_full is not None:
-                    tau = float(args.regularize_overlap_thresh)
-                    denom = max(1e-6, 1.0 - tau)
-                    conf_np = np.clip(
-                        (overlap_full.detach().cpu().numpy() - tau) / denom,
-                        0.0, 1.0,
-                    ).astype(np.float32, copy=False)
-                    edge_weight = edge_weight * conf_np
+                if overlap_full_np is not None:
+                    if _overlap_conf_np is None:
+                        _overlap_conf_np = np.clip(
+                            (overlap_full_np - _overlap_tau) / _overlap_denom,
+                            0.0, 1.0,
+                        ).astype(np.float32, copy=False)
+                    edge_weight = edge_weight * _overlap_conf_np
                 donor_ab = donor_ab_smooth * (1.0 - edge_weight[..., None]) + donor_ab_raw * edge_weight[..., None]
                 print(
                     "[INFO] Chroma edge-preserve blend: "
@@ -2650,11 +2694,11 @@ def main() -> int:
     stage_start = perf_counter()
     print("[INFO] Building before/after diagnostic images ...")
     resample = _resample_bicubic()
-    ref_rgb_full = np.asarray(ref_img.convert("RGB"), dtype=np.uint8)
+    ref_rgb_full = ref_rgb  # already computed before color transfer block
     src_resized_to_ref = src_img.resize((ref_w, ref_h), resample=resample)
     src_resized_rgb_full = np.asarray(src_resized_to_ref.convert("RGB"), dtype=np.uint8)
-    warped_src_rgb = _tensor_chw_to_uint8(warped_src)
-    warped_src_smooth_rgb = _tensor_chw_to_uint8(warped_src_smooth) if warped_src_smooth is not None else None
+    warped_src_rgb = _cached_raw_rgb if _cached_raw_rgb is not None else _tensor_chw_to_uint8(warped_src)
+    warped_src_smooth_rgb = (_cached_smooth_rgb if _cached_smooth_rgb is not None else _tensor_chw_to_uint8(warped_src_smooth)) if warped_src_smooth is not None else None
 
     diag_w, diag_h = _fit_within_size(ref_w, ref_h, int(args.diag_max_side))
 
@@ -3018,7 +3062,13 @@ def main() -> int:
             continue
         source_path = Path(source) if not isinstance(source, Path) else source
         if source_path.exists():
-            shutil.copy2(source_path, steps_dir / step_name)
+            dest = steps_dir / step_name
+            dest.unlink(missing_ok=True)
+            try:
+                # Hard-link avoids copying megabytes of PNG data.
+                dest.hardlink_to(source_path)
+            except OSError:
+                shutil.copy2(source_path, dest)
 
     print(f"[INFO] Steps folder: {steps_dir.resolve()}")
 

@@ -459,16 +459,15 @@ class RoMaV2(nn.Module):
                 precision = torch.cat((precision_fwd, precision_bwd), dim=0)
             else:
                 precision = None
-            # let's hope H_A is equal to H_B
-            grid = get_normalized_grid(1, H_A, W_A)[0]
+            # Reuse the grid already computed above (same H_A, W_A).
             matches_BA = torch.cat((warp_BA, grid), dim=-1).reshape(-1, 4)
             confidence = torch.cat(
-                (confidence_AB.reshape(-1), confidence_BA.reshape(-1)), dim=0
+                (confidence_AB, confidence_BA.reshape(-1)), dim=0
             )
             matches = torch.cat((matches_AB, matches_BA), dim=0)
         else:
             matches = matches_AB
-            confidence = confidence_AB.reshape(-1)
+            confidence = confidence_AB  # already flat from reshape(-1) above
             precision = precision_AB.reshape(-1, 2, 2) if precision_AB is not None else None
 
         expansion_factor = 4

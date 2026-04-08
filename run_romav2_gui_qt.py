@@ -7,17 +7,19 @@ import re
 import shlex
 import shutil
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 try:
-    from PySide6.QtCore import QProcess, QProcessEnvironment, QRect, QStandardPaths, QTimer, Qt, QUrl, Signal, QPoint
+    from PySide6.QtCore import QProcess, QProcessEnvironment, QRect, QRectF, QStandardPaths, QTimer, Qt, QUrl, Signal, QPoint, QPointF
     from PySide6.QtGui import (
-        QAction, QColor, QDesktopServices, QGuiApplication, QImage,
-        QLinearGradient, QPainter, QPen, QPixmap, QRadialGradient,
+        QAction, QBrush, QColor, QDesktopServices, QGuiApplication, QImage,
+        QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QRadialGradient,
     )
     from PySide6.QtTest import QTest
     from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
@@ -31,6 +33,12 @@ try:
         QDoubleSpinBox,
         QFileDialog,
         QFormLayout,
+        QGraphicsEllipseItem,
+        QGraphicsLineItem,
+        QGraphicsPixmapItem,
+        QGraphicsPolygonItem,
+        QGraphicsScene,
+        QGraphicsView,
         QGridLayout,
         QGroupBox,
         QHBoxLayout,
@@ -88,7 +96,7 @@ Follow these steps in this exact order:
    - do not over-smooth skin
    - do not invent new features
    - if there is a person, do not make the face look modern, plastic, or AI-generated
-   - if there are no people in the photo, don't add any that don't exist
+   - if there are no people in the photo, don’t add any that don’t exist
 5. Colorize the image in vivid but historically plausible natural color:
    - realistic skin tones
    - natural hair color
@@ -96,8 +104,14 @@ Follow these steps in this exact order:
    - realistic background colors
    - avoid oversaturation
 6. Preserve the original pose, expression, framing, composition and photographic realism.
-7. Output only the final restored color image.
-    - do NOT crop in the image or shrink in the edges of the photograph
+7. The output image MUST match the input image as closely as possible:
+    - use the SAME aspect ratio as the input photograph
+    - use the SAME framing and field of view — do NOT zoom in, zoom out, pan, or reframe
+    - every edge of the output must correspond to the same edge of the input — nothing added, nothing removed
+    - do NOT add any border, margin, padding, or letterboxing around the image
+    - do NOT crop into the image or shrink the edges of the photograph
+    - the output should be a pixel-aligned colorized version of the input, not a reimagined scene
+8. Output only the final restored color image.
     - DISPLAY the final image directly in the chat as an embedded image
     - do NOT provide a text download link instead of showing the image"""
 
@@ -179,6 +193,215 @@ class DropImageLabel(QLabel):
             event.accept()
             return
         super().mousePressEvent(event)
+
+
+class _CornerHandle(QGraphicsEllipseItem):
+    """Draggable corner handle for the manual crop overlay."""
+
+    RADIUS = 8
+
+    def __init__(self, x: float, y: float, index: int, crop_widget: "ManualCropWidget") -> None:
+        d = self.RADIUS * 2
+        super().__init__(-self.RADIUS, -self.RADIUS, d, d)
+        self.setPos(x, y)
+        self._index = index
+        self._crop_widget = crop_widget
+        self.setBrush(QBrush(QColor(0, 180, 255, 200)))
+        self.setPen(QPen(QColor(255, 255, 255, 230), 1.5))
+        self.setFlag(QGraphicsEllipseItem.ItemIsMovable, True)
+        self.setFlag(QGraphicsEllipseItem.ItemSendsGeometryChanges, True)
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+        self.setZValue(10)
+
+    def itemChange(self, change, value):  # noqa: N802
+        if change == QGraphicsEllipseItem.ItemPositionChange:
+            # Clamp within the image bounds
+            rect = self._crop_widget.image_rect()
+            if rect is not None:
+                x = max(rect.left(), min(value.x(), rect.right()))
+                y = max(rect.top(), min(value.y(), rect.bottom()))
+                value = QPointF(x, y)
+        if change == QGraphicsEllipseItem.ItemPositionHasChanged:
+            self._crop_widget.update_polygon()
+        return super().itemChange(change, value)
+
+
+class ManualCropWidget(QGraphicsView):
+    """Interactive crop widget with draggable corner handles and polygon overlay.
+
+    Supports 4+ corner points.  The polygon and handles are drawn over the
+    image in scene coordinates that match pixel coordinates.
+    """
+
+    # Emitted when user confirms the crop
+    crop_applied = Signal(object)  # emits list of (x, y) tuples in image-pixel coords
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        self.setDragMode(QGraphicsView.NoDrag)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setStyleSheet("background: #111111; border: none;")
+
+        self._pixmap_item: QGraphicsPixmapItem | None = None
+        self._handles: list[_CornerHandle] = []
+        self._polygon_item: QGraphicsPolygonItem | None = None
+        self._dim_path_item = None  # darkens area outside polygon
+        self._image_w: int = 0
+        self._image_h: int = 0
+
+    # ── Public API ────────────────────────────────────────────────
+
+    def set_image(self, bgr: np.ndarray) -> None:
+        """Load a BGR numpy array as the background image."""
+        import cv2
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        self._image_h, self._image_w = h, w
+        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
+        pix = QPixmap.fromImage(qimg)
+        self._scene.clear()
+        self._handles.clear()
+        self._polygon_item = None
+        self._dim_path_item = None
+        self._pixmap_item = self._scene.addPixmap(pix)
+        self._pixmap_item.setZValue(0)
+        self._scene.setSceneRect(QRectF(0, 0, w, h))
+        self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
+
+    def set_quad(self, points: list[tuple[float, float]]) -> None:
+        """Set the initial corner positions (at least 4 points, image-pixel coords)."""
+        # Remove old handles
+        for h in self._handles:
+            self._scene.removeItem(h)
+        self._handles.clear()
+
+        for i, (px, py) in enumerate(points):
+            handle = _CornerHandle(px, py, i, self)
+            self._scene.addItem(handle)
+            self._handles.append(handle)
+        self.update_polygon()
+
+    def set_default_quad(self) -> None:
+        """Place a default rectangle at 10% inset from edges."""
+        if self._image_w == 0:
+            return
+        mx = self._image_w * 0.10
+        my = self._image_h * 0.10
+        self.set_quad([
+            (mx, my),
+            (self._image_w - mx, my),
+            (self._image_w - mx, self._image_h - my),
+            (mx, self._image_h - my),
+        ])
+
+    def add_point(self, after_index: int | None = None) -> None:
+        """Insert a new point midway between two existing points."""
+        n = len(self._handles)
+        if n < 2:
+            return
+        if after_index is None:
+            after_index = n - 1
+        idx_a = after_index % n
+        idx_b = (after_index + 1) % n
+        ax, ay = self._handles[idx_a].pos().x(), self._handles[idx_a].pos().y()
+        bx, by = self._handles[idx_b].pos().x(), self._handles[idx_b].pos().y()
+        mx, my = (ax + bx) / 2, (ay + by) / 2
+        insert_at = idx_a + 1
+        handle = _CornerHandle(mx, my, insert_at, self)
+        self._scene.addItem(handle)
+        self._handles.insert(insert_at, handle)
+        # Re-index
+        for i, h in enumerate(self._handles):
+            h._index = i
+        self.update_polygon()
+
+    def remove_last_point(self) -> None:
+        """Remove the last added point (minimum 4 kept)."""
+        if len(self._handles) <= 4:
+            return
+        handle = self._handles.pop()
+        self._scene.removeItem(handle)
+        for i, h in enumerate(self._handles):
+            h._index = i
+        self.update_polygon()
+
+    def get_points(self) -> list[tuple[float, float]]:
+        """Return current corner positions in image-pixel coordinates."""
+        return [(h.pos().x(), h.pos().y()) for h in self._handles]
+
+    def image_rect(self) -> QRectF | None:
+        if self._image_w == 0:
+            return None
+        return QRectF(0, 0, self._image_w, self._image_h)
+
+    def update_polygon(self) -> None:
+        """Redraw the polygon outline and the dimmed-out region."""
+        if len(self._handles) < 3:
+            return
+        pts = [QPointF(h.pos().x(), h.pos().y()) for h in self._handles]
+        polygon = QPolygonF(pts)
+
+        # Polygon outline
+        if self._polygon_item is not None:
+            self._scene.removeItem(self._polygon_item)
+        pen = QPen(QColor(0, 180, 255, 220), 2.0)
+        pen.setCosmetic(True)
+        self._polygon_item = self._scene.addPolygon(
+            polygon, pen, QBrush(QColor(0, 180, 255, 25))
+        )
+        self._polygon_item.setZValue(5)
+
+        # Dim area outside polygon
+        if self._dim_path_item is not None:
+            self._scene.removeItem(self._dim_path_item)
+        outer = QPainterPath()
+        outer.addRect(QRectF(0, 0, self._image_w, self._image_h))
+        inner = QPainterPath()
+        inner.addPolygon(polygon)
+        inner.closeSubpath()
+        dim_path = outer - inner  # area outside the polygon
+        self._dim_path_item = self._scene.addPath(
+            dim_path, QPen(Qt.NoPen), QBrush(QColor(0, 0, 0, 140))
+        )
+        self._dim_path_item.setZValue(3)
+
+    # ── Event overrides ───────────────────────────────────────────
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if self._pixmap_item is not None:
+            self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        """Double-click on the polygon edge to add a new point."""
+        if event.button() == Qt.LeftButton and len(self._handles) >= 3:
+            scene_pos = self.mapToScene(event.pos())
+            # Find the closest edge to insert after
+            best_dist = float("inf")
+            best_idx = 0
+            n = len(self._handles)
+            for i in range(n):
+                ax, ay = self._handles[i].pos().x(), self._handles[i].pos().y()
+                bx, by = self._handles[(i + 1) % n].pos().x(), self._handles[(i + 1) % n].pos().y()
+                # Point-to-segment distance
+                dx, dy = bx - ax, by - ay
+                seg_len_sq = dx * dx + dy * dy
+                if seg_len_sq < 1e-6:
+                    continue
+                t = max(0, min(1, ((scene_pos.x() - ax) * dx + (scene_pos.y() - ay) * dy) / seg_len_sq))
+                px, py = ax + t * dx, ay + t * dy
+                dist = ((scene_pos.x() - px) ** 2 + (scene_pos.y() - py) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = i
+            # Only add if reasonably close to an edge (within 30 scene-pixels)
+            if best_dist < 30:
+                self.add_point(best_idx)
+        super().mouseDoubleClickEvent(event)
 
 
 class ClickableImageLabel(QLabel):
@@ -590,8 +813,12 @@ class PhotoColorizerQt(QMainWindow):
     BROWSER_PANEL_MIN_WIDTH = 400
     BROWSER_PANEL_MAX_WIDTH = 620
 
+    # Signal for thread-safe crop detection callback
+    _crop_detect_done = Signal(object)
+
     def __init__(self) -> None:
         super().__init__()
+        self._crop_detect_done.connect(self._on_crop_detect_done)
         self.setWindowTitle("Photo Colorizer (Qt + In-App Browser)")
         self.resize(1760, 980)
         self.setMinimumSize(980, 680)
@@ -941,6 +1168,7 @@ class PhotoColorizerQt(QMainWindow):
         self.show_chat_btn = QPushButton("Show Chat")
         self.show_chat_btn.clicked.connect(self._on_show_chat_button_clicked)
         toolbar.addWidget(self.show_chat_btn)
+
         self.attach_status_label = QLabel("")
         self.attach_status_label.setObjectName("formHint")
         self.attach_status_label.setWordWrap(True)
@@ -969,6 +1197,9 @@ class PhotoColorizerQt(QMainWindow):
         input_header.addWidget(self.input_preview_path, 1)
         input_layout.addLayout(input_header)
 
+        # Stacked widget: 0 = normal drop label, 1 = manual crop widget
+        self.input_view_stack = QStackedWidget()
+
         self.input_preview_label = DropImageLabel("Drop a B&W image here, or click to browse")
         self.input_preview_label.image_dropped.connect(self._on_bw_dropped)
         self.input_preview_label.clicked.connect(self._on_pick_bw)
@@ -976,7 +1207,47 @@ class PhotoColorizerQt(QMainWindow):
         self.input_preview_label.setObjectName("previewLabel")
         self.input_preview_label.setMinimumHeight(180)
         self.input_preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        input_layout.addWidget(self.input_preview_label, 1)
+        self.input_view_stack.addWidget(self.input_preview_label)  # index 0
+
+        self.crop_widget = ManualCropWidget()
+        self.crop_widget.setMinimumHeight(180)
+        self.crop_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.input_view_stack.addWidget(self.crop_widget)  # index 1
+
+        self.input_view_stack.setCurrentIndex(0)
+        input_layout.addWidget(self.input_view_stack, 1)
+
+        # Crop confirmation bar (hidden until crop review is active)
+        crop_bar = QHBoxLayout()
+        crop_bar.setSpacing(8)
+        self.crop_status_label = QLabel("")
+        self.crop_status_label.setObjectName("formHint")
+        self.crop_status_label.setWordWrap(True)
+        crop_bar.addWidget(self.crop_status_label, 1)
+
+        self.crop_add_pt_btn = QPushButton("+ Point")
+        self.crop_add_pt_btn.setToolTip("Add an extra corner (or double-click an edge)")
+        self.crop_add_pt_btn.clicked.connect(lambda: self.crop_widget.add_point())
+        crop_bar.addWidget(self.crop_add_pt_btn)
+
+        self.crop_remove_pt_btn = QPushButton("- Point")
+        self.crop_remove_pt_btn.setToolTip("Remove last added corner (min 4)")
+        self.crop_remove_pt_btn.clicked.connect(lambda: self.crop_widget.remove_last_point())
+        crop_bar.addWidget(self.crop_remove_pt_btn)
+
+        self.crop_confirm_btn = QPushButton("Confirm Crop")
+        self.crop_confirm_btn.setObjectName("primaryAction")
+        self.crop_confirm_btn.clicked.connect(self._on_crop_confirmed)
+        crop_bar.addWidget(self.crop_confirm_btn)
+
+        self.crop_skip_btn = QPushButton("Skip Crop")
+        self.crop_skip_btn.clicked.connect(self._on_crop_skipped)
+        crop_bar.addWidget(self.crop_skip_btn)
+
+        self.crop_bar_widget = QWidget()
+        self.crop_bar_widget.setLayout(crop_bar)
+        self.crop_bar_widget.setVisible(False)
+        input_layout.addWidget(self.crop_bar_widget)
 
         preview_splitter.addWidget(input_card)
 
@@ -1345,6 +1616,7 @@ class PhotoColorizerQt(QMainWindow):
             "QCheckBox { font-weight: 600; padding: 4px 0; color: #e5e7eb; }"
         )
         layout.addWidget(self.border_exclude_check)
+
 
         # Helper label (kept for hasattr compat, hidden by default)
         helper = QLabel("")
@@ -2439,6 +2711,85 @@ class PhotoColorizerQt(QMainWindow):
         if not self._auto_color_step1_scheduled:
             return
         self._auto_color_step1_scheduled = False
+        # Before sending the prompt, verify the B&W image thumbnail is visible
+        # in the ChatGPT composer. This prevents sending a text-only message
+        # when the image hasn't finished attaching (especially on retries).
+        self._wait_for_image_then_send_step1(attempts_left=20, delay_ms=800, paste_retried=False)
+
+    def _wait_for_image_then_send_step1(self, attempts_left: int, delay_ms: int, paste_retried: bool = False) -> None:
+        """Poll until an image thumbnail appears in the ChatGPT composer, then send.
+
+        If the thumbnail hasn't appeared after half the attempts, re-paste
+        the image from the clipboard as a second chance before giving up.
+        """
+        if not self._full_workflow_active and not self._auto_color_step1_after_attach:
+            # Workflow was cancelled while we were waiting
+            return
+        page = self.browser.page()
+        if page is None:
+            return
+
+        def _check(result) -> None:
+            parsed = self._decode_js_result_dict(result) if isinstance(result, dict) else {}
+            has_image = bool(parsed.get("has_image"))
+            if has_image:
+                self._append_log("[INFO] Image thumbnail confirmed in ChatGPT composer.")
+                self._actually_send_color_step1()
+                return
+            if attempts_left <= 0:
+                self._append_log(
+                    "[WARN] Could not confirm image thumbnail in composer after polling. "
+                    "Sending prompt anyway (image may not be attached)."
+                )
+                self._actually_send_color_step1()
+                return
+            # Mid-poll re-paste: if we're halfway through and still no image,
+            # retry the clipboard paste to give the browser another chance.
+            if not paste_retried and attempts_left <= 10:
+                bw_path = Path(self.bw_edit.text().strip()) if hasattr(self, "bw_edit") else Path()
+                if bw_path.exists() and bw_path.is_file():
+                    self._append_log("[INFO] Image not yet visible in composer; retrying clipboard paste...")
+                    self._attach_bw_via_clipboard_paste_only(bw_path)
+                    QTimer.singleShot(1500, lambda: self._wait_for_image_then_send_step1(attempts_left - 1, delay_ms, paste_retried=True))
+                    return
+            if attempts_left in (20, 15, 10, 5):
+                self._append_log("[INFO] Waiting for image thumbnail to appear in ChatGPT composer...")
+            QTimer.singleShot(delay_ms, lambda: self._wait_for_image_then_send_step1(attempts_left - 1, delay_ms, paste_retried=paste_retried))
+
+        page.runJavaScript(self._chatgpt_composer_has_image_js(), _check)
+
+    def _attach_bw_via_clipboard_paste_only(self, bw_path: Path) -> None:
+        """Paste the B&W image into the composer clipboard without triggering auto-send.
+
+        Unlike ``_attach_bw_via_clipboard_paste``, this does NOT call
+        ``_queue_auto_color_step1_after_attach`` — it is only used as a
+        mid-poll retry to get the image into the composer.
+        """
+        if not bw_path.exists() or not bw_path.is_file():
+            return
+        self._ensure_chat_panel_ready(reason="clipboard re-paste retry", focus=True)
+        image = QImage(str(bw_path))
+        if image.isNull():
+            return
+
+        QGuiApplication.clipboard().setImage(image)
+        page = self.browser.page()
+        if page is None:
+            return
+        js = self._chatgpt_focus_composer_js()
+
+        def _after_focus(result) -> None:
+            target = self.browser.focusProxy()
+            if not isinstance(target, QWidget):
+                target = self.browser
+            target.setFocus(Qt.OtherFocusReason)
+            self.browser.setFocus(Qt.OtherFocusReason)
+            QTest.keyClick(target, Qt.Key_V, Qt.ControlModifier)
+
+        page.runJavaScript(js, _after_focus)
+
+    def _actually_send_color_step1(self) -> None:
+        """Send Color Step 1 prompt after image attachment is confirmed."""
         self._auto_get_c1_after_send = True
         started = self._color_step_1(interactive=False)
         if not started:
@@ -2619,6 +2970,65 @@ class PhotoColorizerQt(QMainWindow):
   }
 
   return { ok: false, reason: 'attach_control_not_found' };
+})();
+"""
+
+    @staticmethod
+    def _chatgpt_composer_has_image_js() -> str:
+        """JS that returns {has_image: true/false} by checking for image thumbnails
+        in the ChatGPT composer area (the file-attachment preview chips)."""
+        return """
+(() => {
+  // ChatGPT renders attached image thumbnails inside the composer region.
+  // They appear as <img> tags inside thumbnail/preview containers, or as
+  // background-image chips.  We look for several known patterns.
+  const composer = document.querySelector(
+    '#prompt-textarea, [id*="prompt"], [contenteditable="true"], ' +
+    'div[class*="composer"], div[class*="chat-input"], div[class*="prosemirror"]'
+  );
+  if (!composer) return { has_image: false, reason: 'no_composer' };
+
+  // Walk UP from the composer to its parent form/container so we catch
+  // thumbnail previews that are siblings of the text area.
+  const region = composer.closest('form') || composer.parentElement?.parentElement || composer;
+
+  // Pattern 1: <img> tags with a real src (data: or blob: URLs from pasted images,
+  // or https thumbnail URLs from ChatGPT file processing).
+  const imgs = region.querySelectorAll('img[src]');
+  for (const img of imgs) {
+    const src = img.src || '';
+    // Ignore tiny UI icons (avatar, logo, etc.)
+    if (img.naturalWidth > 30 || img.width > 30 || src.startsWith('blob:') || src.startsWith('data:image')) {
+      return { has_image: true, via: 'img_tag' };
+    }
+  }
+
+  // Pattern 2: file attachment chips — divs with thumbnail background images.
+  const chips = region.querySelectorAll(
+    '[class*="thumbnail"], [class*="preview"], [class*="attachment"], [class*="file-chip"]'
+  );
+  for (const chip of chips) {
+    const style = window.getComputedStyle(chip);
+    const bg = style.backgroundImage || '';
+    if (bg && bg !== 'none') {
+      return { has_image: true, via: 'chip_bg' };
+    }
+    // Some chips contain a nested img
+    if (chip.querySelector('img[src]')) {
+      return { has_image: true, via: 'chip_img' };
+    }
+  }
+
+  // Pattern 3: any element with role="img" inside composer area
+  const roleImgs = region.querySelectorAll('[role="img"]');
+  for (const ri of roleImgs) {
+    const r = ri.getBoundingClientRect();
+    if (r.width > 20 && r.height > 20) {
+      return { has_image: true, via: 'role_img' };
+    }
+  }
+
+  return { has_image: false, reason: 'no_thumbnail_found' };
 })();
 """
 
@@ -3029,8 +3439,10 @@ class PhotoColorizerQt(QMainWindow):
             # Navigate to a fresh ChatGPT chat
             self._append_log("[INFO] Retry: opening fresh ChatGPT chat...")
             self._navigate_chatgpt()
-            # Re-run the full workflow after the page loads
-            QTimer.singleShot(4000, self._restart_workflow_after_retry)
+            # Re-run the full workflow after the page loads.
+            # Use a longer delay on retries — the fresh page needs time to fully
+            # initialise its composer before we can attach an image.
+            QTimer.singleShot(6000, self._restart_workflow_after_retry)
 
         self._delete_current_chat_automated(done=_after_delete)
 
@@ -3201,9 +3613,32 @@ class PhotoColorizerQt(QMainWindow):
 
         self._append_log("[INFO] Auto-open failed; trying clipboard paste fallback (Ctrl+V).")
         self._set_attach_status("trying clipboard paste fallback", ok=None)
+        self._attempt_clipboard_paste_with_focus(page, retries_left=4, bw_path=bw_path)
+
+    def _attempt_clipboard_paste_with_focus(
+        self, page, *, retries_left: int, bw_path: Path
+    ) -> None:
+        """Try to focus the composer and paste; retry if focus fails."""
         js = self._chatgpt_focus_composer_js()
 
         def _after_focus(result) -> None:
+            parsed = self._decode_js_result_dict(result)
+            ok = bool(parsed.get("ok"))
+
+            if not ok and retries_left > 0:
+                reason = str(parsed.get("reason", "unknown"))
+                self._append_log(
+                    f"[INFO] Composer focus not ready ({reason}); "
+                    f"retrying paste in 500ms ({retries_left} left)..."
+                )
+                QTimer.singleShot(
+                    500,
+                    lambda: self._attempt_clipboard_paste_with_focus(
+                        page, retries_left=retries_left - 1, bw_path=bw_path
+                    ),
+                )
+                return
+
             target = self.browser.focusProxy()
             if not isinstance(target, QWidget):
                 target = self.browser
@@ -3211,8 +3646,6 @@ class PhotoColorizerQt(QMainWindow):
             self.browser.setFocus(Qt.OtherFocusReason)
             QTest.keyClick(target, Qt.Key_V, Qt.ControlModifier)
 
-            parsed = self._decode_js_result_dict(result)
-            ok = bool(parsed.get("ok"))
             if ok:
                 self._append_log("[INFO] Sent Ctrl+V to ChatGPT composer with selected B&W image on clipboard.")
             else:
@@ -3222,7 +3655,9 @@ class PhotoColorizerQt(QMainWindow):
                     f"({reason}); Ctrl+V was still sent to the browser."
                 )
             self._set_attach_status("paste attempted; confirm thumbnail appears", ok=None)
-            self._queue_auto_color_step1_after_attach(reason="clipboard-paste attach", delay_ms=850)
+            # Allow extra time for the browser to process the pasted image before
+            # we start polling for the thumbnail (clipboard images can take >1s).
+            self._queue_auto_color_step1_after_attach(reason="clipboard-paste attach", delay_ms=2000)
 
         page.runJavaScript(js, _after_focus)
 
@@ -3481,7 +3916,7 @@ class PhotoColorizerQt(QMainWindow):
     def _auto_upload_bw_to_chatgpt(self, bw_path: Path, retries: int = 3, delay_ms: int = 700) -> None:
         if not bw_path.exists() or not bw_path.is_file():
             return
-        self._ensure_chat_panel_ready(reason="B&W upload automation", focus=False)
+        self._ensure_chat_panel_ready(reason="B&W upload automation", focus=True)
         current = self.browser.url().toString().lower() if hasattr(self, "browser") else ""
         if "chatgpt.com" not in current:
             self._append_log("[INFO] Open ChatGPT first to auto-upload the selected B&W image.")
@@ -3492,32 +3927,12 @@ class PhotoColorizerQt(QMainWindow):
             return
         self.pending_bw_upload_path = bw_path
         self.browser_page.set_pending_upload_path(bw_path)
-        self._set_attach_status("armed (click + in ChatGPT if needed)", ok=None)
 
-        page = self.browser.page()
-        if page is None:
-            return
-
-        js = self._chatgpt_trigger_upload_js()
-
-        def _after(result) -> None:
-            ok = isinstance(result, dict) and bool(result.get("ok"))
-            if ok:
-                via = str(result.get("via", "unknown"))
-                self._append_log(f"[INFO] Triggered ChatGPT upload flow ({via}) using selected B&W image.")
-                self._set_attach_status("upload dialog triggered", ok=True)
-                QTimer.singleShot(1200, lambda: self._fallback_if_upload_not_consumed(bw_path))
-                return
-            if retries - 1 <= 0:
-                self._append_log(
-                    "[WARN] Could not auto-open ChatGPT upload control due browser restrictions. "
-                    "Trying clipboard paste fallback now."
-                )
-                self._attach_bw_via_clipboard_paste(bw_path)
-                return
-            QTimer.singleShot(delay_ms, lambda: self._auto_upload_bw_to_chatgpt(bw_path, retries - 1, delay_ms))
-
-        page.runJavaScript(js, _after)
+        # Programmatic click on <input type="file"> is blocked by Qt WebEngine's
+        # user-activation requirement, so go straight to clipboard paste which
+        # is reliable and avoids wasting ~4s on doomed retries.
+        self._append_log("[INFO] Attaching B&W image via clipboard paste.")
+        self._attach_bw_via_clipboard_paste(bw_path)
 
     def _on_download_requested(self, item) -> None:
         downloads_dir = Path(self.downloads_edit.text().strip() or self._default_downloads_dir())
@@ -3797,6 +4212,171 @@ class PhotoColorizerQt(QMainWindow):
             QMessageBox.warning(self, "Missing prompt", "Prompt is empty.")
             return
 
+        # Run auto-detect and show manual crop confirmation
+        self._append_log("[INFO] Running crop detection on input image...")
+        self._set_status("Detecting borders...")
+        self.run_btn.setEnabled(False)
+
+        self._pending_workflow_bw_path = bw_path
+
+        def _detect() -> None:
+            try:
+                import cv2
+                from romav2.preprocess import analyze_and_crop_image
+                img = cv2.imread(str(bw_path))
+                if img is None:
+                    self._crop_detect_done.emit(None)
+                    return
+                result = analyze_and_crop_image(img, enable_crop=False, debug=False)
+                self._crop_detect_done.emit(result)
+            except Exception:
+                self._crop_detect_done.emit(None)
+
+        threading.Thread(target=_detect, daemon=True).start()
+
+    def _on_crop_detect_done(self, result) -> None:
+        """Handle crop detection result — show crop confirmation UI."""
+        import cv2
+
+        bw_path = self._pending_workflow_bw_path
+        img = cv2.imread(str(bw_path))
+        if img is None:
+            self._append_log("[WARN] Could not read image for crop detection.")
+            self.run_btn.setEnabled(True)
+            self._set_status("Ready")
+            return
+
+        self._crop_source_bgr = img
+        self.crop_widget.set_image(img)
+
+        # Try to get a quad from auto-detect
+        quad_pts = None
+        if result is not None:
+            try:
+                feats = result.features
+                if feats.best_quad is not None:
+                    pts = feats.best_quad.reshape(-1, 2).tolist()
+                    if len(pts) == 4:
+                        from romav2.preprocess.feature_extraction import _order_quad
+                        ordered = _order_quad(np.array(pts, dtype=np.float32))
+                        quad_pts = [(float(p[0]), float(p[1])) for p in ordered]
+                if quad_pts is None and feats.largest_contour is not None:
+                    x, y, rw, rh = cv2.boundingRect(feats.largest_contour)
+                    quad_pts = [
+                        (float(x), float(y)),
+                        (float(x + rw), float(y)),
+                        (float(x + rw), float(y + rh)),
+                        (float(x), float(y + rh)),
+                    ]
+            except Exception:
+                pass
+
+        if quad_pts is not None:
+            self.crop_widget.set_quad(quad_pts)
+            conf = result.decision.confidence if result else 0
+            case = result.decision.case_label.value if result else "unknown"
+            self.crop_status_label.setText(
+                f"Auto-detected: {case} (confidence {conf:.0%}). "
+                "Adjust corners or confirm."
+            )
+            self._append_log(
+                f"[INFO] Crop detection: {case} (confidence={conf:.3f}). "
+                "Showing crop preview for confirmation."
+            )
+        else:
+            self.crop_widget.set_default_quad()
+            self.crop_status_label.setText(
+                "No clear border detected. Adjust corners if needed, or skip."
+            )
+            self._append_log("[INFO] No clear border detected. Showing default crop for manual adjustment.")
+
+        # Show the crop UI
+        self.input_view_stack.setCurrentIndex(1)
+        self.crop_bar_widget.setVisible(True)
+        self._set_status("Review crop — confirm or skip to continue")
+
+    def _on_crop_confirmed(self) -> None:
+        """User confirmed the crop — apply warp and continue workflow."""
+        import cv2
+
+        points = self.crop_widget.get_points()
+        img = self._crop_source_bgr
+        if img is None or len(points) < 3:
+            self._on_crop_skipped()
+            return
+
+        h, w = img.shape[:2]
+
+        if len(points) == 4:
+            from romav2.preprocess.feature_extraction import _order_quad
+            pts = np.array(points, dtype=np.float32)
+            ordered = _order_quad(pts)
+
+            width_top = float(np.linalg.norm(ordered[1] - ordered[0]))
+            width_bot = float(np.linalg.norm(ordered[2] - ordered[3]))
+            height_left = float(np.linalg.norm(ordered[3] - ordered[0]))
+            height_right = float(np.linalg.norm(ordered[2] - ordered[1]))
+
+            out_w = int(max(width_top, width_bot))
+            out_h = int(max(height_left, height_right))
+            if out_w < 10 or out_h < 10:
+                self._append_log("[WARN] Crop region too small, skipping crop.")
+                self._on_crop_skipped()
+                return
+
+            dst = np.array(
+                [[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]],
+                dtype=np.float32,
+            )
+            M = cv2.getPerspectiveTransform(ordered, dst)
+            cropped = cv2.warpPerspective(img, M, (out_w, out_h))
+            self._append_log(f"[INFO] Crop applied: perspective warp to {out_w}x{out_h}")
+        else:
+            poly = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
+            x, y, rw, rh = cv2.boundingRect(poly)
+            margin = max(2, int(min(h, w) * 0.003))
+            x1 = max(0, x - margin)
+            y1 = max(0, y - margin)
+            x2 = min(w, x + rw + margin)
+            y2 = min(h, y + rh + margin)
+            cropped = img[y1:y2, x1:x2].copy()
+            self._append_log(f"[INFO] Crop applied: {len(points)}-pt polygon to ({x1},{y1})-({x2},{y2})")
+
+        # Save cropped image and update the B&W path
+        bw_path = self._pending_workflow_bw_path
+        prepped_name = bw_path.stem + "_cropped" + bw_path.suffix
+        prepped_path = bw_path.parent / prepped_name
+        cv2.imwrite(str(prepped_path), cropped)
+        self._pending_workflow_bw_path = prepped_path
+        self.bw_edit.setText(str(prepped_path))
+        self._append_log(f"[INFO] Saved cropped image: {prepped_path.name}")
+
+        self._exit_crop_review()
+        self._continue_workflow_after_crop()
+
+    def _on_crop_skipped(self) -> None:
+        """User chose to skip cropping — continue with original image."""
+        self._append_log("[INFO] Crop skipped — using original image.")
+        self._exit_crop_review()
+        self._continue_workflow_after_crop()
+
+    def _exit_crop_review(self) -> None:
+        """Hide the crop UI and return to normal input preview."""
+        self.input_view_stack.setCurrentIndex(0)
+        self.crop_bar_widget.setVisible(False)
+        self._crop_source_bgr = None
+
+    def _continue_workflow_after_crop(self) -> None:
+        """Resume the colorization workflow after crop review is done."""
+        bw_path = self._pending_workflow_bw_path
+
+        prompt = self.prompt_box.toPlainText().strip() if hasattr(self, "prompt_box") else ""
+        if not prompt:
+            QMessageBox.warning(self, "Missing prompt", "Prompt is empty.")
+            self.run_btn.setEnabled(True)
+            self._set_status("Ready")
+            return
+
         self._locked_workflow_prompt = prompt
         self._append_log(f"[INFO] Locked Step 2 prompt for this run ({len(prompt)} chars).")
         self._ensure_chat_panel_ready(reason="Colorize workflow", focus=True)
@@ -3809,6 +4389,8 @@ class PhotoColorizerQt(QMainWindow):
                 "ChatGPT loading",
                 "Chat panel was opened and ChatGPT is loading. Click Colorize again once the page is ready.",
             )
+            self.run_btn.setEnabled(True)
+            self._set_status("Ready")
             return
 
         self._stop_auto_get_c1_poll()
@@ -3820,7 +4402,6 @@ class PhotoColorizerQt(QMainWindow):
         self._full_workflow_pending_delete = True
         self._c1_image_nudge_sent = False
         self._set_status("Running ChatGPT workflow...")
-        self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
         # Start shimmer immediately with loading messages (no C1 source yet)
         if hasattr(self, "shimmer_widget") and hasattr(self, "result_stack"):
