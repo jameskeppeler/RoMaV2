@@ -198,7 +198,7 @@ class DropImageLabel(QLabel):
 class _CornerHandle(QGraphicsEllipseItem):
     """Draggable corner handle for the manual crop overlay."""
 
-    RADIUS = 8
+    RADIUS = 24
 
     def __init__(self, x: float, y: float, index: int, crop_widget: "ManualCropWidget") -> None:
         d = self.RADIUS * 2
@@ -207,11 +207,27 @@ class _CornerHandle(QGraphicsEllipseItem):
         self._index = index
         self._crop_widget = crop_widget
         self.setBrush(QBrush(QColor(0, 180, 255, 200)))
-        self.setPen(QPen(QColor(255, 255, 255, 230), 1.5))
+        self.setPen(QPen(QColor(255, 255, 255, 230), 2.5))
         self.setFlag(QGraphicsEllipseItem.ItemIsMovable, True)
         self.setFlag(QGraphicsEllipseItem.ItemSendsGeometryChanges, True)
         self.setCursor(Qt.CursorShape.SizeAllCursor)
         self.setZValue(10)
+        self._dragging = False
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        self._dragging = True
+        self._crop_widget.show_magnifier(self.pos())
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        super().mouseMoveEvent(event)
+        if self._dragging:
+            self._crop_widget.show_magnifier(self.pos())
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._dragging = False
+        self._crop_widget.hide_magnifier()
+        super().mouseReleaseEvent(event)
 
     def itemChange(self, change, value):  # noqa: N802
         if change == QGraphicsEllipseItem.ItemPositionChange:
@@ -252,6 +268,12 @@ class ManualCropWidget(QGraphicsView):
         self._dim_path_item = None  # darkens area outside polygon
         self._image_w: int = 0
         self._image_h: int = 0
+        # Magnifier state
+        self._mag_visible = False
+        self._mag_center = QPointF(0, 0)  # scene coords of magnified point
+        self._mag_zoom = 3.0  # magnification factor
+        self._mag_radius = 80  # radius of the loupe in view pixels
+        self._source_pixmap: QPixmap | None = None  # cached full image for sampling
 
     # ── Public API ────────────────────────────────────────────────
 
@@ -263,10 +285,12 @@ class ManualCropWidget(QGraphicsView):
         self._image_h, self._image_w = h, w
         qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
         pix = QPixmap.fromImage(qimg)
+        self._source_pixmap = pix  # cache for magnifier
         self._scene.clear()
         self._handles.clear()
         self._polygon_item = None
         self._dim_path_item = None
+        self._mag_visible = False
         self._pixmap_item = self._scene.addPixmap(pix)
         self._pixmap_item.setZValue(0)
         self._scene.setSceneRect(QRectF(0, 0, w, h))
@@ -368,6 +392,83 @@ class ManualCropWidget(QGraphicsView):
             dim_path, QPen(Qt.NoPen), QBrush(QColor(0, 0, 0, 140))
         )
         self._dim_path_item.setZValue(3)
+
+    # ── Magnifier ─────────────────────────────────────────────────
+
+    def show_magnifier(self, scene_pos: QPointF) -> None:
+        self._mag_visible = True
+        self._mag_center = scene_pos
+        self.viewport().update()
+
+    def hide_magnifier(self) -> None:
+        self._mag_visible = False
+        self.viewport().update()
+
+    def drawForeground(self, painter: QPainter, rect: QRectF) -> None:  # noqa: N802
+        """Draw a circular magnifier loupe over the viewport."""
+        super().drawForeground(painter, rect)
+        if not self._mag_visible or self._source_pixmap is None:
+            return
+
+        # Map the magnified centre from scene coords to viewport coords
+        vp_center = self.mapFromScene(self._mag_center)
+        r = self._mag_radius
+        zoom = self._mag_zoom
+
+        # Offset the loupe above-right of the handle so it doesn't obscure it
+        offset_x = int(r * 1.3)
+        offset_y = int(-r * 1.3)
+        loupe_cx = vp_center.x() + offset_x
+        loupe_cy = vp_center.y() + offset_y
+
+        # Keep the loupe within the viewport
+        vw, vh = self.viewport().width(), self.viewport().height()
+        if loupe_cx + r > vw:
+            loupe_cx = vp_center.x() - offset_x  # flip to left
+        if loupe_cy - r < 0:
+            loupe_cy = vp_center.y() - offset_y  # flip below
+        loupe_cx = max(r, min(vw - r, loupe_cx))
+        loupe_cy = max(r, min(vh - r, loupe_cy))
+
+        # Source rect in the original pixmap (image-pixel coords)
+        src_half = r / zoom
+        # We need to figure out the scaling from scene to viewport to get
+        # the correct source size from the original image
+        t = self.transform()
+        sx = t.m11()  # horizontal scale factor (scene → viewport)
+        img_half = src_half / sx if sx > 0 else src_half
+        cx, cy = self._mag_center.x(), self._mag_center.y()
+        src_rect = QRectF(cx - img_half, cy - img_half, img_half * 2, img_half * 2)
+
+        # Switch to viewport (device) coordinates for painting
+        painter.save()
+        painter.resetTransform()
+
+        # Clip to circular loupe
+        clip_path = QPainterPath()
+        clip_path.addEllipse(QPointF(loupe_cx, loupe_cy), r, r)
+        painter.setClipPath(clip_path)
+
+        # Draw the magnified portion of the source image
+        dest_rect = QRectF(loupe_cx - r, loupe_cy - r, r * 2, r * 2)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.drawPixmap(dest_rect, self._source_pixmap, src_rect)
+
+        # Draw crosshair at loupe centre
+        painter.setClipping(False)
+        cross_pen = QPen(QColor(255, 255, 255, 180), 1.0)
+        painter.setPen(cross_pen)
+        ch = 8
+        painter.drawLine(QPointF(loupe_cx - ch, loupe_cy), QPointF(loupe_cx + ch, loupe_cy))
+        painter.drawLine(QPointF(loupe_cx, loupe_cy - ch), QPointF(loupe_cx, loupe_cy + ch))
+
+        # Draw loupe border
+        border_pen = QPen(QColor(255, 255, 255, 220), 2.5)
+        painter.setPen(border_pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(QPointF(loupe_cx, loupe_cy), r, r)
+
+        painter.restore()
 
     # ── Event overrides ───────────────────────────────────────────
 
@@ -4333,18 +4434,27 @@ class PhotoColorizerQt(QMainWindow):
             self._append_log(f"[INFO] Crop applied: perspective warp to {out_w}x{out_h}")
         else:
             poly = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
+            mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(mask, [poly], 255)
             x, y, rw, rh = cv2.boundingRect(poly)
             margin = max(2, int(min(h, w) * 0.003))
             x1 = max(0, x - margin)
             y1 = max(0, y - margin)
             x2 = min(w, x + rw + margin)
             y2 = min(h, y + rh + margin)
-            cropped = img[y1:y2, x1:x2].copy()
-            self._append_log(f"[INFO] Crop applied: {len(points)}-pt polygon to ({x1},{y1})-({x2},{y2})")
+            # Build BGRA with transparent pixels outside polygon
+            bgra = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+            bgra[:, :, 3] = mask
+            cropped = bgra[y1:y2, x1:x2].copy()
+            self._append_log(f"[INFO] Crop applied: {len(points)}-pt polygon to ({x1},{y1})-({x2},{y2}) with alpha")
 
         # Save cropped image and update the B&W path
         bw_path = self._pending_workflow_bw_path
-        prepped_name = bw_path.stem + "_cropped" + bw_path.suffix
+        # Use .png for >4-point crops (alpha transparency) otherwise keep original suffix
+        if len(points) > 4:
+            prepped_name = bw_path.stem + "_cropped.png"
+        else:
+            prepped_name = bw_path.stem + "_cropped" + bw_path.suffix
         prepped_path = bw_path.parent / prepped_name
         cv2.imwrite(str(prepped_path), cropped)
         self._pending_workflow_bw_path = prepped_path
