@@ -7,7 +7,6 @@ import re
 import shlex
 import shutil
 import sys
-import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -16,7 +15,7 @@ import numpy as np
 from PIL import Image
 
 try:
-    from PySide6.QtCore import QProcess, QProcessEnvironment, QRect, QRectF, QStandardPaths, QTimer, Qt, QUrl, Signal, QPoint, QPointF
+    from PySide6.QtCore import QProcess, QProcessEnvironment, QRect, QRectF, QStandardPaths, QThread, QTimer, Qt, QUrl, Signal, QPoint, QPointF
     from PySide6.QtGui import (
         QAction, QBrush, QColor, QDesktopServices, QGuiApplication, QImage,
         QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QRadialGradient,
@@ -66,6 +65,28 @@ except ImportError as exc:
 
 
 ROMA_SETTINGS = ("turbo", "fast", "base", "precise", "mega1500", "scannet1500", "wxbs", "satast")
+
+
+class _CropDetectWorker(QThread):
+    """Run crop detection off the main thread with proper Qt signal safety."""
+    done = Signal(object)
+
+    def __init__(self, bw_path: str, parent=None):
+        super().__init__(parent)
+        self._bw_path = bw_path
+
+    def run(self):
+        try:
+            import cv2
+            from romav2.preprocess import analyze_and_crop_image
+            img = cv2.imread(self._bw_path)
+            if img is None:
+                self.done.emit(None)
+                return
+            result = analyze_and_crop_image(img, enable_crop=False, debug=False)
+            self.done.emit(result)
+        except Exception:
+            self.done.emit(None)
 IMAGE_FILTER = "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
@@ -82,13 +103,21 @@ PREVIEW_FILES = [
 ]
 
 
-DEFAULT_PREP_PROMPT = """Restore this old photograph in one continuous edit and produce a single final image.
+DEFAULT_PREP_PROMPT = """Colorize this old black-and-white photograph into FULL COLOR and produce a single final image.
 
-Follow these steps in this exact order:
-1. Detect whether the photo includes any visible frame, mount, border card, decorative mat, case edge, or non-image surround.
-2. If present, crop/trim away the surround so only the original photographic image area remains.
-3. Neutralize the aged sepia, yellow, or brown cast before colorization. Do not leave an overall antique tint unless an object is truly that color.
-4. Restore the photo carefully:
+CRITICAL — The output MUST be in FULL COLOR. Do NOT return a black-and-white, grayscale, or sepia image. Every part of the image must be colorized with realistic, historically plausible colors.
+
+CRITICAL — Framing rules (highest priority):
+- The output MUST have the EXACT same framing, field of view, and aspect ratio as the input.
+- Do NOT zoom in, zoom out, pan, reframe, or crop the image AT ALL.
+- Every edge of the output must correspond to the same edge of the input — nothing added, nothing removed.
+- Do NOT add any border, margin, padding, or letterboxing.
+- If the photo has a visible frame or border, KEEP it — do not crop it away.
+- The output should be a pixel-aligned colorized version of the input, not a reimagined scene.
+
+Steps:
+1. Neutralize the aged sepia, yellow, or brown cast completely before colorization.
+2. Restore the photo carefully:
    - improve sharpness and fine detail
    - recover facial features, hair, clothing texture, and background detail
    - reduce blur, haze, dust, scratches, stains, cracks, and age damage
@@ -97,23 +126,19 @@ Follow these steps in this exact order:
    - do not invent new features
    - if there is a person, do not make the face look modern, plastic, or AI-generated
    - if there are no people in the photo, don’t add any that don’t exist
-5. Colorize the image in vivid but historically plausible natural color:
-   - realistic skin tones
+3. COLORIZE the entire image in vivid but historically plausible FULL COLOR:
+   - realistic skin tones (not gray or sepia)
    - natural hair color
    - accurate clothing colors for the era
+   - blue sky, green grass/trees, colored buildings — every element must have realistic color
    - realistic background colors
-   - avoid oversaturation
-6. Preserve the original pose, expression, framing, composition and photographic realism.
-7. The output image MUST match the input image as closely as possible:
-    - use the SAME aspect ratio as the input photograph
-    - use the SAME framing and field of view — do NOT zoom in, zoom out, pan, or reframe
-    - every edge of the output must correspond to the same edge of the input — nothing added, nothing removed
-    - do NOT add any border, margin, padding, or letterboxing around the image
-    - do NOT crop into the image or shrink the edges of the photograph
-    - the output should be a pixel-aligned colorized version of the input, not a reimagined scene
-8. Output only the final restored color image.
+   - avoid oversaturation but ensure the image is clearly and obviously in full color
+4. Preserve the original pose, expression, framing, composition and photographic realism.
+5. Output only the final restored FULL COLOR image — same framing as input, no cropping.
     - DISPLAY the final image directly in the chat as an embedded image
     - do NOT provide a text download link instead of showing the image"""
+
+EXPANSION_FOLLOWUP_PROMPT = "Expand the colorized image"
 
 
 class AutoUploadWebPage(QWebEnginePage):
@@ -914,12 +939,8 @@ class PhotoColorizerQt(QMainWindow):
     BROWSER_PANEL_MIN_WIDTH = 400
     BROWSER_PANEL_MAX_WIDTH = 620
 
-    # Signal for thread-safe crop detection callback
-    _crop_detect_done = Signal(object)
-
     def __init__(self) -> None:
         super().__init__()
-        self._crop_detect_done.connect(self._on_crop_detect_done)
         self.setWindowTitle("Photo Colorizer (Qt + In-App Browser)")
         self.resize(1760, 980)
         self.setMinimumSize(980, 680)
@@ -954,11 +975,15 @@ class PhotoColorizerQt(QMainWindow):
         self._auto_get_c1_polling = False
         self._auto_get_c1_poll_deadline_monotonic: float | None = None
         self._auto_get_c1_poll_attempt = 0
+        self._c1_poll_tick_active = False
+        self._c1_download_attempt_active = False
         self._full_workflow_active = False
         self._full_workflow_waiting_for_c1 = False
         self._full_workflow_pending_delete = False
+        self._full_workflow_phase: str = "colorize"  # "colorize" | "expand"
         self._c1_image_nudge_sent = False
         self._c1_workflow_retry_count = 0
+        self._c1_workflow_generation = 0  # bumped on retry to cancel stale async chains
         self._c1_prompt_sent_monotonic: float | None = None  # when C1 prompt was sent
         self._delete_target_conv_id: str | None = None
         self._run_started_monotonic: float | None = None
@@ -969,6 +994,7 @@ class PhotoColorizerQt(QMainWindow):
         self._current_preview_paths: dict[str, Path] = {}
         self._selected_preview_title: str | None = None
         self._input_preview_pixmap: QPixmap | None = None
+        self._scaled_preview_cache: dict[tuple, QPixmap] = {}  # (cacheKey, w, h) -> scaled
         self._c1_preview_pixmap: QPixmap | None = None
         self._last_run_outdir: Path | None = None
         self._last_download_result_path: Path | None = None
@@ -1916,8 +1942,15 @@ class PhotoColorizerQt(QMainWindow):
         self._refresh_workflow_status()
 
     def _ensure_chat_panel_ready(self, *, reason: str, focus: bool) -> None:
-        panel_hidden = hasattr(self, "browser_panel") and (not self.browser_panel.isVisible())
-        if panel_hidden:
+        panel_collapsed = False
+        if hasattr(self, "browser_panel"):
+            if not self.browser_panel.isVisible():
+                panel_collapsed = True
+            elif hasattr(self, "toggle_browser_action") and not self.toggle_browser_action.isChecked():
+                panel_collapsed = True
+            elif self.browser_panel.width() < 60:
+                panel_collapsed = True
+        if panel_collapsed:
             self._set_browser_panel_visible(True)
             self._append_log(f"[INFO] Chat panel auto-opened for {reason}.")
         if focus and hasattr(self, "browser"):
@@ -2171,7 +2204,7 @@ class PhotoColorizerQt(QMainWindow):
             return candidate
         i = 1
         while True:
-            probe = base / f"colorize_{stamp}{suffix}_{i}"
+            probe = base / f"colorize_{stamp}_{i}"
             if not probe.exists():
                 return probe
             i += 1
@@ -2466,12 +2499,14 @@ class PhotoColorizerQt(QMainWindow):
         self._refresh_workflow_status()
 
     def _stop_prewarm_if_running(self) -> None:
-        if self.prewarm_process is None or self.prewarm_process.state() == QProcess.NotRunning:
+        proc = self.prewarm_process
+        if proc is None or proc.state() == QProcess.NotRunning:
             return
         self._prewarm_stop_requested = True
-        self.prewarm_process.terminate()
-        if not self.prewarm_process.waitForFinished(1200):
-            self.prewarm_process.kill()
+        proc.terminate()
+        if not proc.waitForFinished(500):
+            proc.kill()
+            proc.waitForFinished(500)
         self.prewarm_process = None
         self._prewarm_setting = None
         self._prewarm_partial = ""
@@ -2788,8 +2823,11 @@ class PhotoColorizerQt(QMainWindow):
             self._auto_prefill_prompt(retries=5, delay_ms=700)
         if (
             self._full_workflow_active
+            and self._full_workflow_phase == "colorize"
             and self.pending_bw_upload_path is not None
             and self.pending_bw_upload_path.exists()
+            and not self._auto_color_step1_after_attach
+            and not self._auto_color_step1_scheduled
         ):
             QTimer.singleShot(900, lambda: self._auto_upload_bw_to_chatgpt(self.pending_bw_upload_path, retries=5, delay_ms=800))
 
@@ -2857,7 +2895,7 @@ class PhotoColorizerQt(QMainWindow):
                 self._append_log("[INFO] Waiting for image thumbnail to appear in ChatGPT composer...")
             QTimer.singleShot(delay_ms, lambda: self._wait_for_image_then_send_step1(attempts_left - 1, delay_ms, paste_retried=paste_retried))
 
-        page.runJavaScript(self._chatgpt_composer_has_image_js(), _check)
+        page.runJavaScript(self._chatgpt_composer_has_image_js(), 0, _check)
 
     def _attach_bw_via_clipboard_paste_only(self, bw_path: Path) -> None:
         """Paste the B&W image into the composer clipboard without triggering auto-send.
@@ -2887,7 +2925,7 @@ class PhotoColorizerQt(QMainWindow):
             self.browser.setFocus(Qt.OtherFocusReason)
             QTest.keyClick(target, Qt.Key_V, Qt.ControlModifier)
 
-        page.runJavaScript(js, _after_focus)
+        page.runJavaScript(js, 0, _after_focus)
 
     def _actually_send_color_step1(self) -> None:
         """Send Color Step 1 prompt after image attachment is confirmed."""
@@ -2900,6 +2938,7 @@ class PhotoColorizerQt(QMainWindow):
                 self._full_workflow_active = False
                 self._full_workflow_waiting_for_c1 = False
                 self._full_workflow_pending_delete = False
+                self._full_workflow_phase = "colorize"
                 self._locked_workflow_prompt = ""
                 self._set_status("Ready")
                 self._refresh_workflow_status()
@@ -2908,6 +2947,7 @@ class PhotoColorizerQt(QMainWindow):
         self._auto_get_c1_polling = False
         self._auto_get_c1_poll_deadline_monotonic = None
         self._auto_get_c1_poll_attempt = 0
+        self._c1_poll_tick_active = False
 
     _C1_MIN_WAIT_SEC = 30  # ChatGPT needs at least this long to generate an image
 
@@ -2930,6 +2970,10 @@ class PhotoColorizerQt(QMainWindow):
     def _auto_get_c1_poll_tick(self, interval_ms: int) -> None:
         if not self._auto_get_c1_polling:
             return
+        if self._c1_poll_tick_active:
+            QTimer.singleShot(max(1000, int(interval_ms)), lambda: self._auto_get_c1_poll_tick(interval_ms))
+            return
+        self._c1_poll_tick_active = True
         if self._c1_download_request_seen or self._pending_auto_import_download_path is not None:
             self._stop_auto_get_c1_poll()
             return
@@ -2937,20 +2981,14 @@ class PhotoColorizerQt(QMainWindow):
         if deadline is not None and time.monotonic() >= deadline:
             self._stop_auto_get_c1_poll()
             if self._full_workflow_active and self._full_workflow_waiting_for_c1:
-                if not self._c1_image_nudge_sent:
-                    self._append_log(
-                        "[WARN] Auto Get C1 timed out. Sending nudge to ChatGPT..."
-                    )
-                    self._c1_image_nudge_sent = True
-                    self._nudge_chatgpt_for_image()
-                    return
                 if self._c1_workflow_retry_count < 2:
                     self._c1_workflow_retry_count += 1
                     self._append_log(
-                        f"[WARN] Auto Get C1 timed out after nudge. "
+                        f"[WARN] Auto Get C1 timed out. "
                         f"Deleting chat and retrying (attempt {self._c1_workflow_retry_count + 1}/3)..."
                     )
                     self._retry_c1_workflow_from_scratch()
+                    self._c1_poll_tick_active = False
                     return
             self._append_log(
                 "[WARN] Auto Get C1 timed out waiting for a downloadable ChatGPT image. "
@@ -2958,6 +2996,7 @@ class PhotoColorizerQt(QMainWindow):
             )
             if self._full_workflow_active and self._full_workflow_waiting_for_c1:
                 self._set_status("Waiting for manual ChatGPT download...")
+            self._c1_poll_tick_active = False
             return
 
         self._auto_get_c1_poll_attempt += 1
@@ -2965,11 +3004,13 @@ class PhotoColorizerQt(QMainWindow):
             self._append_log("[INFO] Auto Get C1: checking ChatGPT for download availability...")
 
         if self._awaiting_c1_download:
+            self._c1_poll_tick_active = False
             QTimer.singleShot(max(1000, int(interval_ms)), lambda: self._auto_get_c1_poll_tick(interval_ms))
             return
 
         self._download_and_import_c1(interactive=False, quiet=True)
 
+        self._c1_poll_tick_active = False
         QTimer.singleShot(max(1000, int(interval_ms)), lambda: self._auto_get_c1_poll_tick(interval_ms))
 
     def _auto_prefill_prompt(self, retries: int, delay_ms: int) -> None:
@@ -3408,14 +3449,21 @@ class PhotoColorizerQt(QMainWindow):
 
     def _attempt_chatgpt_download(self, retries: int = 6, delay_ms: int = 600, *, quiet: bool = False) -> None:
         if self._c1_download_request_seen:
+            self._c1_download_attempt_active = False
             return
+        # Prevent overlapping download attempt chains.
+        if retries == 6 and self._c1_download_attempt_active:
+            return
+        self._c1_download_attempt_active = True
         page = self.browser.page()
         if page is None:
+            self._c1_download_attempt_active = False
             return
         js = self._chatgpt_download_js()
 
         def _after(result) -> None:
             if self._c1_download_request_seen:
+                self._c1_download_attempt_active = False
                 return
             ok = isinstance(result, dict) and bool(result.get("ok"))
             if ok:
@@ -3427,9 +3475,12 @@ class PhotoColorizerQt(QMainWindow):
                         delay_ms,
                         lambda: self._attempt_chatgpt_download(retries - 1, delay_ms, quiet=quiet),
                     )
+                else:
+                    self._c1_download_attempt_active = False
                 return
 
             if retries <= 0:
+                self._c1_download_attempt_active = False
                 if not self._c1_download_request_seen:
                     # Fallback: try extracting the inline image directly from the DOM
                     self._attempt_inline_image_extract(quiet=quiet)
@@ -3446,9 +3497,9 @@ class PhotoColorizerQt(QMainWindow):
                     lambda: self._attempt_chatgpt_download(retries - 1, delay_ms, quiet=quiet),
                 )
 
-            page.runJavaScript(menu_js, _after_menu)
+            page.runJavaScript(menu_js, 0, _after_menu)
 
-        page.runJavaScript(js, _after)
+        page.runJavaScript(js, 0, _after)
 
     def _attempt_inline_image_extract(self, *, quiet: bool = False) -> None:
         """Fallback: extract the last large inline image from the ChatGPT DOM
@@ -3477,20 +3528,10 @@ class PhotoColorizerQt(QMainWindow):
             self._awaiting_c1_download = False
             reason = str(result.get("reason", "unknown")) if isinstance(result, dict) else "unknown"
             if self._full_workflow_active and self._full_workflow_waiting_for_c1:
-                if not self._c1_image_nudge_sent:
-                    # First failure: send a follow-up nudge message asking ChatGPT to show the image
-                    self._c1_image_nudge_sent = True
-                    self._append_log(
-                        f"[INFO] No inline image found ({reason}). "
-                        "Sending follow-up nudge to ChatGPT..."
-                    )
-                    self._nudge_chatgpt_for_image()
-                    return
-                # Nudge already sent and still no image — delete chat and retry
                 if self._c1_workflow_retry_count < 2:
                     self._c1_workflow_retry_count += 1
                     self._append_log(
-                        f"[WARN] ChatGPT did not display an image after nudge. "
+                        f"[WARN] No inline image found ({reason}). "
                         f"Deleting chat and retrying (attempt {self._c1_workflow_retry_count + 1}/3)..."
                     )
                     self._retry_c1_workflow_from_scratch()
@@ -3509,27 +3550,12 @@ class PhotoColorizerQt(QMainWindow):
                     "this app will auto-import the next completed image download."
                 )
 
-        page.runJavaScript(js, _after_extract)
-
-    _C1_NUDGE_MESSAGE = (
-        "Please display the final restored image directly in the chat as an inline image. "
-        "Do not provide a download link — show the image itself."
-    )
-
-    def _nudge_chatgpt_for_image(self) -> None:
-        """Send a short follow-up message asking ChatGPT to re-display the image inline."""
-        self._append_log("[INFO] Sending nudge: asking ChatGPT to display the image inline...")
-        self._paste_prompt_clipboard_then_send(
-            self._C1_NUDGE_MESSAGE,
-            send_retries=12,
-            send_delay_ms=700,
-        )
-        # Resume polling to pick up the image after ChatGPT responds
-        self._start_auto_get_c1_poll(timeout_sec=120, interval_ms=8000)
+        page.runJavaScript(js, 0, _after_extract)
 
     def _retry_c1_workflow_from_scratch(self) -> None:
         """Delete the current chat, navigate to a fresh ChatGPT page, and re-run
         the full workflow (re-attach B&W image + re-send prompt)."""
+        self._c1_workflow_generation += 1  # cancel stale send/download retries
         self._stop_auto_get_c1_poll()
 
         def _after_delete(success: bool) -> None:
@@ -3555,6 +3581,7 @@ class PhotoColorizerQt(QMainWindow):
         if not bw_path.exists():
             self._append_log("[WARN] Retry aborted: B&W image not found.")
             self._full_workflow_active = False
+            self._full_workflow_phase = "colorize"
             self._set_status("Ready")
             self._refresh_workflow_status()
             return
@@ -3565,6 +3592,7 @@ class PhotoColorizerQt(QMainWindow):
         self._auto_color_step1_scheduled = False
         self._full_workflow_waiting_for_c1 = True
         self._full_workflow_pending_delete = True
+        self._full_workflow_phase = "colorize"
         attempt = self._c1_workflow_retry_count + 1
         self._append_log(f"[INFO] Retry: re-running workflow (attempt {attempt}/3)...")
         self._set_status(f"Retrying ChatGPT workflow (attempt {attempt}/3)...")
@@ -3760,7 +3788,7 @@ class PhotoColorizerQt(QMainWindow):
             # we start polling for the thumbnail (clipboard images can take >1s).
             self._queue_auto_color_step1_after_attach(reason="clipboard-paste attach", delay_ms=2000)
 
-        page.runJavaScript(js, _after_focus)
+        page.runJavaScript(js, 0, _after_focus)
 
     def _fallback_if_upload_not_consumed(self, bw_path: Path) -> None:
         if self.browser_page is None:
@@ -3804,7 +3832,7 @@ class PhotoColorizerQt(QMainWindow):
                     f"({reason})."
                 )
 
-        page.runJavaScript(js, _after_focus)
+        page.runJavaScript(js, 0, _after_focus)
 
     def _paste_prompt_clipboard_then_send(
         self,
@@ -3819,8 +3847,11 @@ class PhotoColorizerQt(QMainWindow):
         if page is None:
             return
         js = self._chatgpt_focus_composer_js()
+        gen = self._c1_workflow_generation
 
         def _after_focus(result) -> None:
+            if gen != self._c1_workflow_generation:
+                return  # workflow was retried; abandon this stale paste/send
             target = self.browser.focusProxy()
             if not isinstance(target, QWidget):
                 target = self.browser
@@ -3840,10 +3871,10 @@ class PhotoColorizerQt(QMainWindow):
                 )
             QTimer.singleShot(
                 280,
-                lambda: self._attempt_chatgpt_send(retries=send_retries, delay_ms=send_delay_ms),
+                lambda: self._attempt_chatgpt_send(retries=send_retries, delay_ms=send_delay_ms, _gen=gen),
             )
 
-        page.runJavaScript(js, _after_focus)
+        page.runJavaScript(js, 0, _after_focus)
 
     def _attempt_prompt_fill_then_send(
         self,
@@ -3852,7 +3883,11 @@ class PhotoColorizerQt(QMainWindow):
         retries: int = 12,
         delay_ms: int = 550,
     ) -> None:
+        gen = self._c1_workflow_generation
+
         def _attempt(remaining: int) -> None:
+            if gen != self._c1_workflow_generation:
+                return
             self._inject_prompt_into_chatgpt(
                 prompt,
                 silent=True,
@@ -3860,9 +3895,11 @@ class PhotoColorizerQt(QMainWindow):
             )
 
         def _after_inject(success: bool, remaining: int) -> None:
+            if gen != self._c1_workflow_generation:
+                return
             if success:
                 self._append_log("[INFO] Prompt transferred to ChatGPT composer.")
-                QTimer.singleShot(220, lambda: self._attempt_chatgpt_send(retries=12, delay_ms=700))
+                QTimer.singleShot(220, lambda: self._attempt_chatgpt_send(retries=12, delay_ms=700, _gen=gen))
                 return
 
             if remaining > 0:
@@ -3873,6 +3910,7 @@ class PhotoColorizerQt(QMainWindow):
                     return
                 page.runJavaScript(
                     self._chatgpt_focus_composer_js(),
+                    0,
                     lambda _r: QTimer.singleShot(delay_ms, lambda: _attempt(remaining - 1)),
                 )
                 return
@@ -3884,7 +3922,11 @@ class PhotoColorizerQt(QMainWindow):
 
         _attempt(max(0, int(retries)))
 
-    def _attempt_chatgpt_send(self, retries: int = 10, delay_ms: int = 700) -> None:
+    def _attempt_chatgpt_send(self, retries: int = 10, delay_ms: int = 700, _gen: int | None = None) -> None:
+        if _gen is None:
+            _gen = self._c1_workflow_generation
+        elif _gen != self._c1_workflow_generation:
+            return  # stale retry from a cancelled workflow generation
         self._ensure_chat_panel_ready(reason="ChatGPT send action", focus=False)
         page = self.browser.page()
         if page is None:
@@ -3918,13 +3960,13 @@ class PhotoColorizerQt(QMainWindow):
                     self._append_log(
                         f"[INFO] Waiting for ChatGPT send control to become ready ({reason})..."
                     )
-                QTimer.singleShot(delay_ms, lambda: self._attempt_chatgpt_send(retries - 1, delay_ms))
+                QTimer.singleShot(delay_ms, lambda: self._attempt_chatgpt_send(retries - 1, delay_ms, _gen=_gen))
                 return
 
             if retries > 0:
                 if retries in (10, 7, 4, 1):
                     self._append_log(f"[INFO] Retrying ChatGPT send ({reason})...")
-                QTimer.singleShot(delay_ms, lambda: self._attempt_chatgpt_send(retries - 1, delay_ms))
+                QTimer.singleShot(delay_ms, lambda: self._attempt_chatgpt_send(retries - 1, delay_ms, _gen=_gen))
                 return
 
             self._append_log("[WARN] Send button click failed. Trying Enter-key fallback.")
@@ -4229,13 +4271,27 @@ class PhotoColorizerQt(QMainWindow):
                 f"({reason}). Prompt copied to clipboard instead. Click inside ChatGPT message box and paste."
             )
 
-        page.runJavaScript(js, _on_done)
+        page.runJavaScript(js, 0, _on_done)
 
     def _import_download_path(self, image_path: Path, *, source_label: str) -> None:
         if not image_path.exists() or not image_path.is_file():
             self._append_log(f"[WARN] {source_label}: image not found: {image_path}")
             return
         self._stop_auto_get_c1_poll()
+        # During the colorize phase, don't show the intermediate image as the
+        # C1 result — wait for the expanded image instead.
+        if (
+            self._full_workflow_active
+            and self._full_workflow_waiting_for_c1
+            and self._full_workflow_phase == "colorize"
+        ):
+            self._full_workflow_waiting_for_c1 = False
+            self._append_log(
+                f"[INFO] {source_label}: initial colorized image downloaded ({image_path.name}). "
+                "Requesting expansion before importing as C1..."
+            )
+            self._send_expansion_followup()
+            return
         self.color_edit.setText(str(image_path))
         self._sync_c1_preview_from_field()
         if not self._current_preview_paths:
@@ -4245,14 +4301,33 @@ class PhotoColorizerQt(QMainWindow):
         self._refresh_workflow_status()
         if self._full_workflow_active and self._full_workflow_waiting_for_c1:
             self._full_workflow_waiting_for_c1 = False
+            # "expand" phase — we have the final expanded image. Proceed to delete + run.
             if self._full_workflow_pending_delete:
                 self._append_log(
-                    "[INFO] Workflow: C1 imported. Deleting ChatGPT conversation before overlay run."
+                    "[INFO] Workflow: expanded C1 imported. Deleting ChatGPT conversation before overlay run."
                 )
                 self._full_workflow_pending_delete = False
                 self._delete_current_chat_automated(done=self._on_full_workflow_delete_done)
                 return
             self._on_full_workflow_delete_done(False)
+
+    def _send_expansion_followup(self) -> None:
+        """Send the expansion follow-up message and start polling for the second image."""
+        self._full_workflow_phase = "expand"
+        self._full_workflow_waiting_for_c1 = True
+        self._c1_image_nudge_sent = False
+        self._auto_get_c1_after_send = True
+        # Reset the download state machine so the expansion poll cycle works
+        # (these are stale from the first colorize download).
+        self._c1_download_request_seen = False
+        self._awaiting_c1_download = False
+        self._c1_download_attempt_active = False
+        self._auto_import_next_download = False
+        self._pending_auto_import_download_path = None
+        self._set_status("Running ChatGPT workflow (expansion)...")
+        self._set_attach_status("workflow running: requesting expanded framing", ok=None)
+        self._append_log("[INFO] Expansion Step: filling follow-up prompt and sending to ChatGPT.")
+        self._attempt_prompt_fill_then_send(EXPANSION_FOLLOWUP_PROMPT, retries=12, delay_ms=550)
 
     def _import_latest_download(self) -> None:
         downloads_dir = Path(self.downloads_edit.text().strip() or self._default_downloads_dir())
@@ -4320,20 +4395,9 @@ class PhotoColorizerQt(QMainWindow):
 
         self._pending_workflow_bw_path = bw_path
 
-        def _detect() -> None:
-            try:
-                import cv2
-                from romav2.preprocess import analyze_and_crop_image
-                img = cv2.imread(str(bw_path))
-                if img is None:
-                    self._crop_detect_done.emit(None)
-                    return
-                result = analyze_and_crop_image(img, enable_crop=False, debug=False)
-                self._crop_detect_done.emit(result)
-            except Exception:
-                self._crop_detect_done.emit(None)
-
-        threading.Thread(target=_detect, daemon=True).start()
+        self._crop_detect_worker = _CropDetectWorker(str(bw_path), parent=self)
+        self._crop_detect_worker.done.connect(self._on_crop_detect_done)
+        self._crop_detect_worker.start()
 
     def _on_crop_detect_done(self, result) -> None:
         """Handle crop detection result — show crop confirmation UI."""
@@ -4510,6 +4574,7 @@ class PhotoColorizerQt(QMainWindow):
         self._full_workflow_active = True
         self._full_workflow_waiting_for_c1 = True
         self._full_workflow_pending_delete = True
+        self._full_workflow_phase = "colorize"
         self._c1_image_nudge_sent = False
         self._set_status("Running ChatGPT workflow...")
         self.stop_btn.setEnabled(False)
@@ -4522,7 +4587,7 @@ class PhotoColorizerQt(QMainWindow):
             self._before_after_active = False
         self._append_log("")
         self._append_log(
-            "[INFO] Colorize workflow started: upload photo -> send prompt -> auto Get C1 -> delete chat -> overlay run."
+            "[INFO] Colorize workflow started: upload photo -> send prompt -> get C1 -> send expansion -> get C2 -> delete chat -> overlay run."
         )
         if hasattr(self, "accuracy_mode_check") and self.accuracy_mode_check.isChecked():
             self._append_log("[INFO] Accuracy mode is ON (preset + stronger multi-pass pre-align + iterative rematch).")
@@ -4541,6 +4606,7 @@ class PhotoColorizerQt(QMainWindow):
         self._full_workflow_active = False
         self._full_workflow_waiting_for_c1 = False
         self._full_workflow_pending_delete = False
+        self._full_workflow_phase = "colorize"
         self._locked_workflow_prompt = ""
         self._append_log("[INFO] Workflow: launching overlay process.")
         self._start_run()
@@ -4553,10 +4619,8 @@ class PhotoColorizerQt(QMainWindow):
             QMessageBox.warning(self, "Run in progress", "A run is already in progress.")
             return
         if self.prewarm_process is not None and self.prewarm_process.state() != QProcess.NotRunning:
-            self._append_log("[INFO] Warmup is running. Waiting briefly for it to finish...")
-            if not self.prewarm_process.waitForFinished(10000):
-                self._append_log("[INFO] Warmup still running; stopping it and continuing with Colorize now.")
-                self._stop_prewarm_if_running()
+            self._append_log("[INFO] Warmup is running; stopping it to start Colorize.")
+            self._stop_prewarm_if_running()
 
         if not self.runner_script.exists():
             QMessageBox.critical(self, "Missing runner", f"Could not find:\n{self.runner_script}")
@@ -4730,11 +4794,12 @@ class PhotoColorizerQt(QMainWindow):
             self._update_pipeline_progress(stripped)
 
     def _on_process_error(self, error) -> None:
-        if self.process is None:
+        proc = self.process
+        if proc is None:
             return
         name = str(error).split(".")[-1]
         self._append_log(f"[ERROR] Runner process error: {name}")
-        if self.process.state() == QProcess.NotRunning:
+        if proc.state() == QProcess.NotRunning:
             self.run_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
             self.process = None
@@ -4817,11 +4882,13 @@ class PhotoColorizerQt(QMainWindow):
         self._refresh_workflow_status()
 
     def _stop_run(self) -> None:
-        if self.process is None or self.process.state() == QProcess.NotRunning:
+        proc = self.process
+        if proc is None or proc.state() == QProcess.NotRunning:
             return
-        self.process.terminate()
-        if not self.process.waitForFinished(3000):
-            self.process.kill()
+        proc.terminate()
+        if not proc.waitForFinished(500):
+            proc.kill()
+            proc.waitForFinished(500)
         self._append_log("[INFO] Stop requested.")
         self._set_status("Stopping...")
 
@@ -4838,6 +4905,7 @@ class PhotoColorizerQt(QMainWindow):
     def _clear_preview_tabs(self) -> None:
         self._result_pixmaps.clear()
         self._current_preview_paths.clear()
+        self._scaled_preview_cache.clear()
         self._selected_preview_title = None
 
     def _load_outputs_placeholder(self) -> None:
@@ -4881,6 +4949,12 @@ class PhotoColorizerQt(QMainWindow):
             self._append_log(f"[WARN] Could not load preview: {image_path}")
             return
 
+        # Cap cache to the number of known preview slots so the primary
+        # output ("Final Colorized") is never evicted by later diagnostics.
+        while len(self._result_pixmaps) >= max(len(PREVIEW_FILES), 8):
+            oldest = next(iter(self._result_pixmaps))
+            del self._result_pixmaps[oldest]
+            self._current_preview_paths.pop(oldest, None)
         self._result_pixmaps[title] = pix
         self._current_preview_paths[title] = image_path
         self._refresh_output_previews()
@@ -4893,9 +4967,14 @@ class PhotoColorizerQt(QMainWindow):
             else:
                 target_w = max(120, self.input_preview_label.width() - 12)
                 target_h = max(120, self.input_preview_label.height() - 12)
-                scaled = self._input_preview_pixmap.scaled(
-                    target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation
-                )
+                cache_key = ("input", self._input_preview_pixmap.cacheKey(), target_w, target_h)
+                scaled = self._scaled_preview_cache.get(cache_key)
+                if scaled is None:
+                    scaled = self._input_preview_pixmap.scaled(
+                        target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                    )
+                    self._scaled_preview_cache.clear()
+                    self._scaled_preview_cache[cache_key] = scaled
                 self.input_preview_label.setText("")
                 self.input_preview_label.setPixmap(scaled)
 
@@ -4954,7 +5033,11 @@ class PhotoColorizerQt(QMainWindow):
 
         target_w = max(120, self.result_preview_label.width() - 12)
         target_h = max(120, self.result_preview_label.height() - 12)
-        scaled = pix.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        result_cache_key = ("result", pix.cacheKey(), target_w, target_h)
+        scaled = self._scaled_preview_cache.get(result_cache_key)
+        if scaled is None:
+            scaled = pix.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self._scaled_preview_cache[result_cache_key] = scaled
         self.result_preview_label.setText("")
         self.result_preview_label.setPixmap(scaled)
         self.result_preview_label.setToolTip("Click to view full screen")

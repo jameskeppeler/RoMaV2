@@ -224,20 +224,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--disable-auto-border-crop",
-        action="store_true",
-        help=(
-            "Disable automatic border/frame crop detection on ref/src before matching. "
-            "Enabled by default to reduce frame-card alignment failures."
-        ),
-    )
-    parser.add_argument(
-        "--border-crop-max-frac",
-        type=float,
-        default=0.12,
-        help="Maximum fraction removable from each side during auto border crop.",
-    )
-    parser.add_argument(
         "--border-exclude-mask",
         action="store_true",
         help=(
@@ -994,101 +980,6 @@ def _scan_uniform_margin(
     return int(idxs[0]) if idxs.size > 0 else n
 
 
-def _auto_crop_border_like_margin(
-    img: Image.Image,
-    *,
-    max_crop_frac: float = 0.12,
-) -> tuple[Image.Image, dict[str, int], bool]:
-    """Detect and remove thin uniform photo borders/frames.
-
-    Guards against mistaking uniform *backgrounds* (e.g. a studio grey
-    backdrop in a portrait) for borders:
-    - Per-side cap is max_crop_frac (default 12%).
-    - Total area removed must be < 30%.
-    - Aspect ratio change must be < 15%.
-    - At least 3 sides must have detectable border for the crop to fire.
-    """
-    rgb = np.asarray(img.convert("RGB"), dtype=np.uint8)
-    h, w, _ = rgb.shape
-    no_crop = (img, {"left": 0, "right": 0, "top": 0, "bottom": 0}, False)
-    if h < 128 or w < 128:
-        return no_crop
-
-    luma = rgb.mean(axis=2).astype(np.float32)
-    sat = (rgb.max(axis=2).astype(np.float32) - rgb.min(axis=2).astype(np.float32))
-
-    rim_y = max(2, int(round(h * 0.02)))
-    rim_x = max(2, int(round(w * 0.02)))
-    rim_luma = np.concatenate(
-        [luma[:rim_y, :].ravel(), luma[-rim_y:, :].ravel(), luma[:, :rim_x].ravel(), luma[:, -rim_x:].ravel()]
-    )
-    rim_sat = np.concatenate(
-        [sat[:rim_y, :].ravel(), sat[-rim_y:, :].ravel(), sat[:, :rim_x].ravel(), sat[:, -rim_x:].ravel()]
-    )
-    rim_luma_median = float(np.median(rim_luma))
-    rim_luma_mad = float(np.median(np.abs(rim_luma - rim_luma_median)))
-    rim_sat_median = float(np.median(rim_sat))
-    rim_luma_std = float(np.std(rim_luma))
-
-    # Conservative guard: only attempt auto-crop when the edge appears mostly uniform.
-    if rim_sat_median > 30.0 or rim_luma_std > 38.0:
-        return no_crop
-
-    luma_tol = max(16.0, 2.7 * rim_luma_mad)
-    sat_limit = max(20.0, float(np.percentile(rim_sat, 85)) + 8.0)
-    border_mask = (np.abs(luma - rim_luma_median) <= luma_tol) & (sat <= sat_limit)
-
-    rim_mask = np.zeros((h, w), dtype=bool)
-    rim_mask[:rim_y, :] = True
-    rim_mask[-rim_y:, :] = True
-    rim_mask[:, :rim_x] = True
-    rim_mask[:, -rim_x:] = True
-    rim_border_frac = float(border_mask[rim_mask].mean())
-    if rim_border_frac < 0.70:
-        return no_crop
-
-    max_crop_x = max(0, int(round(w * max(0.0, min(0.30, max_crop_frac)))))
-    max_crop_y = max(0, int(round(h * max(0.0, min(0.30, max_crop_frac)))))
-    left = _scan_uniform_margin(border_mask=border_mask, luma=luma, side="left", max_crop=max_crop_x)
-    right = _scan_uniform_margin(border_mask=border_mask, luma=luma, side="right", max_crop=max_crop_x)
-    top = _scan_uniform_margin(border_mask=border_mask, luma=luma, side="top", max_crop=max_crop_y)
-    bottom = _scan_uniform_margin(border_mask=border_mask, luma=luma, side="bottom", max_crop=max_crop_y)
-
-    min_side_px = max(6, int(round(min(h, w) * 0.01)))
-    sides = sum(int(v >= min_side_px) for v in (left, right, top, bottom))
-    # Require at least 3 sides with a detectable border — a real photo frame
-    # has border on all sides, while uniform background typically only matches
-    # on 1-2 sides adjacent to the backdrop.
-    if sides < 3:
-        return no_crop
-
-    x0 = int(left)
-    y0 = int(top)
-    x1 = int(max(x0 + 1, w - right))
-    y1 = int(max(y0 + 1, h - bottom))
-    new_w = x1 - x0
-    new_h = y1 - y0
-
-    # Reject if more than 30% of total area would be removed.
-    area_frac = (new_w * new_h) / max(1, w * h)
-    if area_frac < 0.70:
-        return no_crop
-
-    # Reject if cropping changes the aspect ratio by more than 15%.
-    orig_ar = w / max(1, h)
-    new_ar = new_w / max(1, new_h)
-    ar_change = abs(new_ar - orig_ar) / max(1e-6, orig_ar)
-    if ar_change > 0.15:
-        return no_crop
-
-    if new_w < int(0.55 * w) or new_h < int(0.55 * h):
-        return no_crop
-    if (left + right + top + bottom) < min_side_px:
-        return no_crop
-
-    cropped = img.crop((x0, y0, x1, y1))
-    return cropped, {"left": left, "right": right, "top": top, "bottom": bottom}, True
-
 
 def _similarity_lstsq(src_pts: np.ndarray, dst_pts: np.ndarray) -> np.ndarray | None:
     n = int(src_pts.shape[0])
@@ -1147,6 +1038,7 @@ def _estimate_similarity_ransac(
     best_count = -1
     best_median = float("inf")
 
+    stagnation = 0
     for _ in range(max(32, iters)):
         idx = rng.choice(n, size=2, replace=False)
         m = _similarity_lstsq(src_pts[idx], dst_pts[idx])
@@ -1164,6 +1056,11 @@ def _estimate_similarity_ransac(
             best_median = med
             best_m = m
             best_inliers = inliers
+            stagnation = 0
+        else:
+            stagnation += 1
+            if stagnation >= 30:
+                break
 
     if best_m is None or best_inliers is None:
         return None, 0.0, float("inf")
@@ -1484,9 +1381,6 @@ def main() -> int:
     if not (0.05 <= float(args.bw_midtone_target) <= 0.95):
         print("[ERROR] --bw-midtone-target must be in [0.05, 0.95].", file=sys.stderr)
         return 1
-    if not (0.0 <= float(args.border_crop_max_frac) <= 0.30):
-        print("[ERROR] --border-crop-max-frac must be in [0, 0.30].", file=sys.stderr)
-        return 1
     if not (0.0 <= float(args.min_global_inlier_ratio) <= 1.0):
         print("[ERROR] --min-global-inlier-ratio must be in [0, 1].", file=sys.stderr)
         return 1
@@ -1570,18 +1464,11 @@ def main() -> int:
 
     ref_img = Image.open(args.ref).convert("RGB")
     src_img = Image.open(args.src).convert("RGB")
-    ref_orig_w, ref_orig_h = ref_img.size
-    ref_orig_img = ref_img.copy()  # keep original for final output restoration
     src_orig_w, src_orig_h = src_img.size
     ref_match_path = args.ref
     src_match_path = args.src
 
     preprocessing: dict[str, object] = {
-        "auto_border_crop_enabled": not bool(args.disable_auto_border_crop),
-        "ref_crop_applied": False,
-        "src_crop_applied": False,
-        "ref_crop_margins_lrtb": [0, 0, 0, 0],
-        "src_crop_margins_lrtb": [0, 0, 0, 0],
         "global_prealign_enabled": bool(effective_global_prealign_enabled),
         "global_prealign_applied": False,
         "global_prealign_candidate_applied": False,
@@ -1612,51 +1499,31 @@ def main() -> int:
         "iterative_rematch_pass_metrics": [],
     }
 
-    if not args.disable_auto_border_crop:
-        max_crop_frac = float(max(0.0, min(0.30, args.border_crop_max_frac)))
-        ref_cropped, ref_margins, ref_applied = _auto_crop_border_like_margin(
-            ref_img,
-            max_crop_frac=max_crop_frac,
-        )
-        if ref_applied:
-            ref_img = ref_cropped
-            ref_match_path = args.outdir / "ref_autocropped.png"
-            ref_img.save(ref_match_path)
-            preprocessing["ref_crop_applied"] = True
-            preprocessing["ref_crop_margins_lrtb"] = [
-                int(ref_margins["left"]),
-                int(ref_margins["right"]),
-                int(ref_margins["top"]),
-                int(ref_margins["bottom"]),
-            ]
-            print(
-                "[INFO] Auto-cropped border from ref "
-                f"(L{ref_margins['left']} R{ref_margins['right']} T{ref_margins['top']} B{ref_margins['bottom']})."
-            )
-
-        src_cropped, src_margins, src_applied = _auto_crop_border_like_margin(
-            src_img,
-            max_crop_frac=max_crop_frac,
-        )
-        if src_applied:
-            src_img = src_cropped
-            src_match_path = args.outdir / "src_autocropped.png"
-            src_img.save(src_match_path)
-            preprocessing["src_crop_applied"] = True
-            preprocessing["src_crop_margins_lrtb"] = [
-                int(src_margins["left"]),
-                int(src_margins["right"]),
-                int(src_margins["top"]),
-                int(src_margins["bottom"]),
-            ]
-            print(
-                "[INFO] Auto-cropped border from src "
-                f"(L{src_margins['left']} R{src_margins['right']} T{src_margins['top']} B{src_margins['bottom']})."
-            )
-
     ref_w, ref_h = ref_img.size
     src_w, src_h = src_img.size
     print(f"[INFO] Loaded images. ref={ref_w}x{ref_h}, src={src_w}x{src_h}")
+
+    # Auto-upscale source if it is significantly smaller than the reference.
+    # When RoMa squishes both images to the same internal resolution (e.g.
+    # 800x800), a large pixel-size mismatch means the scene appears at very
+    # different scales, causing poor overlap.  Upscaling the source to
+    # approximately match the reference's longer side fixes this.
+    _src_upscale_threshold = 0.72  # trigger when src longest side < 72% of ref
+    ref_long = max(ref_w, ref_h)
+    src_long = max(src_w, src_h)
+    if src_long > 0 and ref_long > 0 and (src_long / ref_long) < _src_upscale_threshold:
+        upscale_factor = ref_long / src_long
+        new_src_w = max(1, int(round(src_w * upscale_factor)))
+        new_src_h = max(1, int(round(src_h * upscale_factor)))
+        resample = getattr(Image, "LANCZOS", getattr(Image.Resampling, "LANCZOS", Image.BICUBIC))
+        src_img = src_img.resize((new_src_w, new_src_h), resample=resample)
+        src_match_path = args.outdir / "src_upscaled.png"
+        src_img.save(src_match_path)
+        src_w, src_h = src_img.size
+        print(
+            f"[INFO] Source auto-upscaled {upscale_factor:.2f}x to {src_w}x{src_h} "
+            f"(ref longest side={ref_long}, src was {src_long})."
+        )
     ref_mp = (ref_w * ref_h) / 1_000_000.0
     src_mp = (src_w * src_h) / 1_000_000.0
     print(
@@ -2106,6 +1973,9 @@ def main() -> int:
             if preprocessing["iterative_rematch_score_final"] is None:
                 preprocessing["iterative_rematch_score_final"] = current_score
 
+        del src_tensor_for_rematch, ref_tensor_for_score, ref_luma_for_score
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         print(
             f"[TIMING] Iterative re-match stage: {perf_counter() - rematch_stage_start:.2f}s"
         )
@@ -2279,7 +2149,7 @@ def main() -> int:
         src_tensor,
         warp_ab_full.unsqueeze(0),
         mode="bilinear",
-        padding_mode="border",
+        padding_mode="zeros",
         align_corners=False,
     )[0]
     warped_src_path = args.outdir / "warped_src_to_ref.png"
@@ -2324,7 +2194,7 @@ def main() -> int:
             src_tensor,
             warp_smooth_full.unsqueeze(0),
             mode="bilinear",
-            padding_mode="border",
+            padding_mode="zeros",
             align_corners=False,
         )[0]
         warped_smooth_path = args.outdir / "warped_src_smooth.png"
@@ -2382,8 +2252,11 @@ def main() -> int:
     output_files.append(corr_vis_path)
     print(f"[TIMING] Sampling/correspondence vis: {perf_counter() - stage_start:.2f}s")
 
-    # Free RoMa model to reclaim VRAM
+    # Free RoMa model and remaining prediction tensors to reclaim VRAM
     del model
+    for _k in list(preds.keys()):
+        if _k not in ("warp_AB", "overlap_AB"):
+            del preds[_k]
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -2449,6 +2322,14 @@ def main() -> int:
         alpha_path = args.outdir / "regularization_alpha.png"
         Image.fromarray(alpha_img).save(alpha_path)
         output_files.append(alpha_path)
+
+    # Free GPU tensors no longer needed after regularization stage.
+    del src_tensor, ref_tensor, warp_ab_full, confidence_mask
+    del warped_src_masked, validity, validity_chw, in_bounds
+    if overlap_full is not None:
+        del overlap_full
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # --- Photoshop-style Color blend transfer ---
     stage_start = perf_counter()
@@ -2622,8 +2503,12 @@ def main() -> int:
         color_transfer_chroma_scale_applied = chroma_scale
         if abs(chroma_scale - 1.0) > 1e-4:
             donor_lab[..., 1:3] *= np.float32(chroma_scale)
+            clipped_count = int(np.sum(
+                (donor_lab[..., 1:3] < -128.0) | (donor_lab[..., 1:3] > 127.0)
+            ))
             donor_lab[..., 1:3] = np.clip(donor_lab[..., 1:3], -128.0, 127.0)
-            print(f"[INFO] Chroma boost applied: total_scale={chroma_scale:.3f}")
+            clip_msg = f", clipped_pixels={clipped_count}" if clipped_count > 0 else ""
+            print(f"[INFO] Chroma boost applied: total_scale={chroma_scale:.3f}{clip_msg}")
 
         donor_rgb = _lab_to_rgb(donor_lab)
 
@@ -2648,33 +2533,8 @@ def main() -> int:
             border_mask=border_mask,
         )
 
-        # Keep cropped-size version for diagnostics (which all work at ref_w x ref_h).
+        # Keep ref-size version for diagnostics (which all work at ref_w x ref_h).
         final_rgb_cropped = final_rgb
-
-        # If the ref image was auto-cropped, paste the colorized region back
-        # into the original-sized B&W image so the output matches the input.
-        # Normalize the full original first so its border tones match the
-        # color-blended centre (avoids sepia-vs-neutral seam at crop edge).
-        if preprocessing.get("ref_crop_applied"):
-            lrtb = preprocessing["ref_crop_margins_lrtb"]
-            left, right, top, bottom = lrtb[0], lrtb[1], lrtb[2], lrtb[3]
-            orig_rgb_raw = np.asarray(ref_orig_img.convert("RGB"), dtype=np.uint8)
-            if not args.disable_bw_gray_balance:
-                orig_rgb, _ = _normalize_bw_base_for_overlay(
-                    orig_rgb_raw,
-                    black_clip=float(args.bw_black_point_clip),
-                    white_clip=float(args.bw_white_point_clip),
-                    midtone_target=float(args.bw_midtone_target),
-                )
-            else:
-                orig_rgb = orig_rgb_raw.copy()
-            orig_rgb[top:ref_orig_h - bottom, left:ref_orig_w - right] = final_rgb
-            final_rgb = orig_rgb
-            print(
-                f"[INFO] Restored final output to original dimensions "
-                f"({ref_orig_w}x{ref_orig_h}), pasting colorized region at "
-                f"L{left} T{top} R{right} B{bottom}."
-            )
 
         final_colorized_path = args.outdir / "final_colorized.png"
         Image.fromarray(final_rgb).save(final_colorized_path)
@@ -2699,6 +2559,15 @@ def main() -> int:
     src_resized_rgb_full = np.asarray(src_resized_to_ref.convert("RGB"), dtype=np.uint8)
     warped_src_rgb = _cached_raw_rgb if _cached_raw_rgb is not None else _tensor_chw_to_uint8(warped_src)
     warped_src_smooth_rgb = (_cached_smooth_rgb if _cached_smooth_rgb is not None else _tensor_chw_to_uint8(warped_src_smooth)) if warped_src_smooth is not None else None
+    del _cached_raw_rgb, _cached_smooth_rgb
+    # All GPU tensors now captured to numpy — free remaining VRAM.
+    del warped_src
+    if warped_src_smooth is not None:
+        del warped_src_smooth
+    if warped_regularized_tensor is not None:
+        del warped_regularized_tensor
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     diag_w, diag_h = _fit_within_size(ref_w, ref_h, int(args.diag_max_side))
 
@@ -2770,7 +2639,6 @@ def main() -> int:
         "inputs": {
             "ref_path": str(args.ref.resolve()),
             "src_path": str(args.src.resolve()),
-            "ref_original_size_wh": [int(ref_orig_w), int(ref_orig_h)],
             "src_original_size_wh": [int(src_orig_w), int(src_orig_h)],
             "ref_match_size_wh": [int(ref_w), int(ref_h)],
             "src_match_size_wh": [int(src_w), int(src_h)],
@@ -2871,14 +2739,8 @@ def main() -> int:
         f"cuda_available: {summary['cuda_available']}",
         f"cuda_device_name: {summary['cuda_device_name']}",
         f"roma_device: {summary['roma_device']}",
-        (
-            f"ref: {summary['inputs']['ref_path']} "
-            f"(orig {ref_orig_w}x{ref_orig_h}, match {ref_w}x{ref_h})"
-        ),
-        (
-            f"src: {summary['inputs']['src_path']} "
-            f"(orig {src_orig_w}x{src_orig_h}, match {src_w}x{src_h})"
-        ),
+        f"ref: {summary['inputs']['ref_path']} ({ref_w}x{ref_h})",
+        f"src: {summary['inputs']['src_path']} (orig {src_orig_w}x{src_orig_h}, match {src_w}x{src_h})",
         f"setting: {summary['model']['setting']}",
         f"setting_requested: {summary['model']['setting_requested']}",
         f"accuracy_mode: {bool(summary['model']['accuracy_mode'])}",
@@ -2963,20 +2825,6 @@ def main() -> int:
             else "mae_after_final_colorized_vs_ref: n/a"
         ),
         "",
-        (
-            "preprocessing_auto_border_crop: "
-            f"{bool(preprocessing['auto_border_crop_enabled'])}"
-        ),
-        (
-            "preprocessing_ref_crop: "
-            f"{bool(preprocessing['ref_crop_applied'])} "
-            f"margins_lrtb={preprocessing['ref_crop_margins_lrtb']}"
-        ),
-        (
-            "preprocessing_src_crop: "
-            f"{bool(preprocessing['src_crop_applied'])} "
-            f"margins_lrtb={preprocessing['src_crop_margins_lrtb']}"
-        ),
         (
             "preprocessing_global_prealign: "
             f"enabled={bool(preprocessing['global_prealign_enabled'])}, "
